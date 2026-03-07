@@ -9,15 +9,20 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        "brand-navy": "#0D1B2A",
-        "brand-teal": "#0A9396",
-        "brand-teal-light": "#E0F5F5",
+        "quanto-navy": "#0D1B2A",
+        "quanto-teal": "#0A9396",
+        "quanto-teal-mid": "#C8ECED",
+        "quanto-teal-bg": "#F0FAFA",
         "score-green": "#2D9B5A",
+        "score-green-bg": "#EBF7F0",
         "score-amber": "#F4A261",
+        "score-amber-bg": "#FEF3E8",
         "score-red": "#E63946",
+        "score-red-bg": "#FDECED",
         surface: "#F8F9FA",
         card: "#FFFFFF",
         "border-subtle": "#E2E8F0",
+        "text-muted": "#6B7280",
       },
     },
   },

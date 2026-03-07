@@ -3,13 +3,14 @@ import { DM_Sans } from "next/font/google";
 import "./globals.css";
 
 const dmSans = DM_Sans({
-  weight: ["400", "500", "700"],
+  weight: ["400", "500", "600", "700"],
   subsets: ["latin"],
   variable: "--font-dm-sans",
 });
 
 export const metadata: Metadata = {
-  title: "Quanto Firm Health Scorecard",
+  title: "Quanto | Firm Health Scorecard",
+  description: "Instant due diligence on any QuickBooks file.",
 };
 
 export default function RootLayout({
