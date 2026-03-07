@@ -69,6 +69,11 @@ export default function Home() {
     if (result) setViewMode(result.viewMode);
   }, [result?.viewMode]);
 
+  function filenameToFirmName(filename: string): string {
+    const base = filename.replace(/\.[^/.]+$/, "").replace(/[-_]/g, " ");
+    return base ? base.replace(/\b\w/g, (c) => c.toUpperCase()) : "Firm";
+  }
+
   const handleFile = (file: File) => {
     if (!file.name.toLowerCase().endsWith(".csv")) return;
     setLoading(true);
@@ -82,7 +87,7 @@ export default function Home() {
           const transactions = parseTransactions(rows);
           const scorecard = buildScorecard(
             transactions,
-            file.name.replace(/\.csv$/i, "") || "Firm"
+            filenameToFirmName(file.name)
           );
           setResult(scorecard);
         } catch (err) {
@@ -669,7 +674,7 @@ function AccountHealthSection({
         {result.accounts.map((acc) => (
           <div
             key={acc.accountName}
-            className="bg-card border border-border-subtle rounded-2xl p-5 shadow-sm relative group"
+            className="group relative bg-card border border-border-subtle rounded-2xl p-5 shadow-sm"
           >
             <div className="flex justify-between items-start">
               <h3 className="font-semibold text-quanto-navy">{acc.accountName}</h3>
@@ -698,7 +703,7 @@ function AccountHealthSection({
                 $ exposure: ${acc.totalExposureAmount.toLocaleString()}
               </p>
             )}
-            <div className="absolute left-4 right-4 top-full mt-1 p-3 bg-quanto-navy text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-10">
+            <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block bg-quanto-navy text-white text-xs rounded-lg px-3 py-2 whitespace-nowrap z-10">
               {acc.duplicatePairCount} duplicates · {acc.unreconciledCount} unreconciled ·{" "}
               {acc.miscategorizedCount} miscategorized
             </div>

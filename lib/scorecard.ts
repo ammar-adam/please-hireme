@@ -217,7 +217,10 @@ export function detectMiscategorized(
   const anomalies: Anomaly[] = [];
   for (const [account, items] of Array.from(byAccount.entries())) {
     const list = items.map(({ t }) => t);
-    const dollarExposure = list.reduce((s, t) => s + Math.abs(t.amount), 0);
+    // Only uncategorized-account rows have dollar impact; blank name/memo are data quality only
+    const dollarExposure = items
+      .filter(({ reason }) => reason === "Account contains 'uncategorized'")
+      .reduce((s, { t }) => s + Math.abs(t.amount), 0);
     const anomalyTxns: AnomalyTransaction[] = items.map(({ t, reason }) => ({
       date: t.date,
       name: t.name,
@@ -355,7 +358,8 @@ export function detectRoundNumbers(
 
   const anomalies: Anomaly[] = [];
   for (const [account, list] of Array.from(byAccount.entries())) {
-    const dollarExposure = list.reduce((s, t) => s + Math.abs(t.amount), 0);
+    // Round number is a data integrity flag, not dollar risk — amount needs verification only
+    const dollarExposure = 0;
     const anomalyTxns: AnomalyTransaction[] = list.map((t) => ({
       date: t.date,
       name: t.name,
@@ -465,8 +469,12 @@ export function calculateReconciliationLag(
     byAccount.get(key)!.push(t);
   }
 
+  const CATEGORY_SIGNALS = ["uncategorized", "expense", "income", "revenue"];
   const result: AccountHealth[] = [];
   for (const [accountName, list] of Array.from(byAccount.entries())) {
+    const nameLower = accountName.toLowerCase();
+    const isCategory = CATEGORY_SIGNALS.some((s) => nameLower.includes(s));
+    if (isCategory || list.length < 2) continue;
     const sorted = [...list].sort(
       (a, b) => a.date.getTime() - b.date.getTime()
     );
@@ -479,9 +487,11 @@ export function calculateReconciliationLag(
       if (sameBalance && gapDays > 5) lagDurations.push(gapDays);
     }
     const avgLagDays =
-      lagDurations.length === 0
-        ? 0
-        : lagDurations.reduce((s, d) => s + d, 0) / lagDurations.length;
+      lagDurations.length > 0
+        ? parseFloat(
+            (lagDurations.reduce((a, b) => a + b, 0) / lagDurations.length).toFixed(1)
+          )
+        : 0;
 
     let status: "healthy" | "warning" | "critical" = "healthy";
     if (avgLagDays > 14) status = "critical";
@@ -518,14 +528,16 @@ export function calculateScores(
   hoursLostPerMonth: number,
   dateRangeDays: number
 ): FirmScores {
-  // Data Quality (start 100)
+  // Data Quality (start 100) — rate-normalized so small datasets aren't over-penalized
+  const totalTransactions = transactions.length;
+  const normalizer = Math.min(1, totalTransactions / 200);
   let dataQuality = 100;
   for (const a of anomalies) {
-    if (a.type === "duplicate") dataQuality -= 3 * a.count;
-    else if (a.type === "unreconciled") dataQuality -= 2 * a.count;
-    else if (a.type === "ghost_transaction") dataQuality -= 2 * a.count;
-    else if (a.type === "miscategorized") dataQuality -= 1.5 * a.count;
-    else if (a.type === "round_number") dataQuality -= 1 * a.count;
+    if (a.type === "duplicate") dataQuality -= 3 * a.count * normalizer;
+    else if (a.type === "unreconciled") dataQuality -= 2 * a.count * normalizer;
+    else if (a.type === "ghost_transaction") dataQuality -= 2 * a.count * normalizer;
+    else if (a.type === "miscategorized") dataQuality -= 1.5 * a.count * normalizer;
+    else if (a.type === "round_number") dataQuality -= 0.5 * a.count * normalizer;
   }
   for (const acc of accounts) {
     if (acc.status === "warning") dataQuality -= 5;
@@ -533,15 +545,16 @@ export function calculateScores(
   }
   dataQuality = Math.max(0, Math.round(dataQuality));
 
-  // Acquisition Risk (start 0, higher = worse, cap 100)
+  // Acquisition Risk (start 0, higher = worse) — reduced weights + dataset-size cap
   let acquisitionRiskRaw = 0;
   for (const a of anomalies) {
-    if (a.type === "ap_aging") acquisitionRiskRaw += 5 * a.count;
-    else if (a.type === "ar_aging") acquisitionRiskRaw += 8 * a.count;
-    else if (a.type === "duplicate") acquisitionRiskRaw += 3 * a.count;
+    if (a.type === "ap_aging") acquisitionRiskRaw += 4 * a.count;
+    else if (a.type === "ar_aging") acquisitionRiskRaw += 5 * a.count;
+    else if (a.type === "duplicate") acquisitionRiskRaw += 2 * a.count;
     else if (a.type === "ghost_transaction") acquisitionRiskRaw += 2 * a.count;
   }
-  acquisitionRiskRaw = Math.min(100, acquisitionRiskRaw);
+  const riskCap = Math.min(100, 20 + totalTransactions / 10);
+  acquisitionRiskRaw = Math.min(riskCap, acquisitionRiskRaw);
 
   // Automation Potential
   let automationPotential = 40;
@@ -572,18 +585,20 @@ export function calculateScores(
   }
   automationPotential = Math.min(100, automationPotential);
 
-  // Margin Expansion
-  const annualCost = hoursLostPerMonth * 12 * 150;
-  const safeDays = dateRangeDays <= 0 ? 1 : dateRangeDays;
-  const totalDeposits = transactions
-    .filter((t) => t.transactionType.trim().toLowerCase() === "deposit")
-    .reduce((s, t) => s + t.amount, 0);
-  const annualRevenue = totalDeposits > 0 ? (totalDeposits / safeDays) * 365 : 0;
-  let marginExpansion = 0;
-  if (annualRevenue > 0) {
-    const marginImpact = (annualCost / annualRevenue) * 100;
-    marginExpansion = Math.min(100, Math.round(marginImpact * 2));
-  }
+  // Margin Expansion — operational leverage: how much manual work Quanto can displace
+  const journalEntryRatio =
+    transactions.filter((t) => t.transactionType.trim().toLowerCase() === "journal entry")
+      .length / Math.max(1, transactions.length);
+  const highSeverityCount = anomalies.filter((a) => a.severity === "high").length;
+  const manualSignalScore = Math.min(
+    100,
+    Math.round(
+      journalEntryRatio * 200 +
+        hoursLostPerMonth * 8 +
+        highSeverityCount * 5
+    )
+  );
+  const marginExpansion = Math.min(100, manualSignalScore);
 
   // Overall weighted
   const overall = Math.round(
@@ -715,14 +730,11 @@ export function buildScorecard(
     dateRangeDays
   );
 
-  const avgReconciliationLagDays =
-    accounts.length === 0
-      ? 0
-      : parseFloat(
-          (
-            accounts.reduce((s, a) => s + a.avgLagDays, 0) / accounts.length
-          ).toFixed(1)
-        );
+  const avgReconciliationLagDays = parseFloat(
+    (
+      accounts.reduce((s, a) => s + a.avgLagDays, 0) / Math.max(1, accounts.length)
+    ).toFixed(1)
+  );
 
   const topAnomaly =
     allAnomalies.length === 0
