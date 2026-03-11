@@ -1,4 +1,5 @@
 export interface QBOTransaction {
+  id: string;
   date: Date;
   transactionType: string;
   num: string;
@@ -7,21 +8,8 @@ export interface QBOTransaction {
   account: string;
   split: string;
   amount: number;
-  /** null when Balance cell is blank or unparseable */
+  /** blank CSV cells = null */
   balance: number | null;
-}
-
-export interface AccountHealth {
-  accountName: string;
-  avgLagDays: number;
-  daysSinceLastReconciled: number;
-  /** number of pairs, not individual transactions */
-  duplicatePairCount: number;
-  unreconciledCount: number;
-  miscategorizedCount: number;
-  /** sum of dollar amounts tied to anomalies in this account */
-  totalExposureAmount: number;
-  status: "healthy" | "warning" | "critical";
 }
 
 export type AnomalyType =
@@ -30,75 +18,96 @@ export type AnomalyType =
   | "miscategorized"
   | "ap_aging"
   | "ar_aging"
-  | "expense_spike"
+  | "owner_dependency"
   | "round_number"
-  | "ghost_transaction";
-
-export interface AnomalyTransaction {
-  date: Date;
-  name: string;
-  memo: string;
-  account: string;
-  amount: number;
-  transactionType: string;
-  /** plain English: why this specific transaction was flagged */
-  flagReason: string;
-}
+  | "balance_jump";
 
 export interface Anomaly {
+  id: string;
   type: AnomalyType;
   account: string;
-  /** for duplicate: pair count. for others: item count. */
   count: number;
-  /** count * per-item rate */
-  totalManualFixMins: number;
-  /** sum of Amount across all transactions in this anomaly group */
+  affectedTransactions: QBOTransaction[];
+  manualFixMins: number;
   dollarExposure: number;
   severity: "high" | "medium" | "low";
-  /** the actual transactions causing this anomaly — used for drill-down */
-  transactions: AnomalyTransaction[];
+  /** plain English, references actual vendor names and amounts */
+  mathExplanation: string;
+}
+
+export interface AccountHealth {
+  accountName: string;
+  avgLagDays: number;
+  unreconciledCount: number;
+  duplicateCount: number;
+  miscategorizedCount: number;
+  status: "healthy" | "warning" | "critical";
+  daysSinceLastTransaction: number;
+  /** sum of duplicate + unreconciled + miscategorized for this account */
+  openIssues: number;
+  affectedTransactions: QBOTransaction[];
+}
+
+export interface ScoreBreakdown {
+  category: string;
+  /** starting value before penalties */
+  rawScore: number;
+  /** sum of all deductions */
+  penalty: number;
+  /** plain English explanation */
+  explanation: string;
+  affectedAnomalies: Anomaly[];
 }
 
 export interface TopIssue extends Anomaly {
-  /** Template: 'Your {account} account has {count} {typeLabel} entries totalling ${dollarExposure} — estimated {hoursFixed} hours to fix manually.' */
   plainEnglishDescription: string;
-  /** Always hardcoded: '< 3 minutes' */
+  /** always '< 3 minutes' */
   quantoFixTime: string;
-  /** totalManualFixMins minus 3 */
   timeSavedMins: number;
-}
-
-export interface FirmScores {
-  /** 0–100 */
-  dataQuality: number;
-  /** 0–100. Higher = more risky. Stored as raw; display as (100 - raw) so higher = safer */
-  acquisitionRisk: number;
-  /** 0–100 */
-  automationPotential: number;
-  /** 0–100 */
-  marginExpansion: number;
-  /** 0–100. Weighted composite */
-  overall: number;
-  grade: "A" | "B" | "C" | "D";
 }
 
 export interface ScorecardResult {
   firmName: string;
   generatedAt: Date;
-  scores: FirmScores;
-  avgReconciliationLagDays: number;
-  /** sum of all anomaly.count values */
-  totalAnomalies: number;
-  hoursLostPerMonth: number;
-  /** hoursLostPerMonth * 12 * 150 */
-  projectedAnnualSavings: number;
-  /** sum of dollarExposure across all anomalies */
-  totalDollarExposure: number;
-  /** (total manual fix mins / 60) * 150 */
-  cleanupCostEstimate: number;
+  mode: "buyer" | "seller";
+  dataQualityScore: number;
+  /** labeled 'Valuation Risk' in seller mode UI only */
+  acquisitionRiskScore: number;
+  automationPotentialScore: number;
+  marginExpansionScore: number;
+  overallGrade: "A" | "B" | "C" | "D";
+  scoreBreakdowns: ScoreBreakdown[];
   accounts: AccountHealth[];
   anomalies: Anomaly[];
   topIssue: TopIssue;
-  /** UI toggle — does not affect calculation, only framing of displayed copy */
-  viewMode: "buyer" | "seller";
+  /** AP aging total + AR aging total */
+  liabilityExposure: number;
+  /** total manual fix mins / 60 * 150 */
+  cleanupCostEstimate: number;
+  hoursLostPerMonth: number;
+  projectedAnnualSavings: number;
+  aiNarrative: string | null;
+}
+
+export type PanelType = "score" | "anomaly" | "account" | "stat";
+
+export interface PanelContext {
+  type: PanelType;
+  payload: ScoreBreakdown | Anomaly | AccountHealth | StatPayload;
+}
+
+export interface StatPayload {
+  name: string;
+  value: number | string;
+  explanation: string;
+  relatedAnomalies?: Anomaly[];
+  relatedAccounts?: AccountHealth[];
+}
+
+export interface SampleDefinition {
+  id: string;
+  firmName: string;
+  description: string;
+  grade: "A" | "B" | "C" | "D";
+  transactions: QBOTransaction[];
 }
