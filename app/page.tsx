@@ -86,6 +86,90 @@ const QUANTO_FIX_DESCRIPTIONS: Record<string, string> = {
 const SEVERITY_ORDER = { high: 0, medium: 1, low: 2 };
 type SampleWithGrade = SampleDefinition & { computedGrade: "A" | "B" | "C" | "D" };
 
+// ── Radar (spider) chart — 4 dimensions, pure SVG ─────────────────────────────
+
+function RadarChart({
+  scores,
+  labels,
+  getColor,
+}: {
+  scores: [number, number, number, number];
+  labels: [string, string, string, string];
+  getColor: (score: number) => string;
+}) {
+  const cx = 70;
+  const cy = 70;
+  const R = 52;
+  const axes = 4;
+  const angleStep = (2 * Math.PI) / axes;
+  const toPoint = (score: number, i: number) => {
+    const angle = -Math.PI / 2 + i * angleStep;
+    return {
+      x: cx + R * (score / 100) * Math.cos(angle),
+      y: cy - R * (score / 100) * Math.sin(angle),
+    };
+  };
+  const benchmark = 85;
+  const dataPoints = scores.map((s, i) => toPoint(s, i));
+  const benchPoints = scores.map((_, i) => toPoint(benchmark, i));
+  const dataPoly = dataPoints.map((p) => `${p.x},${p.y}`).join(" ");
+  const benchPoly = benchPoints.map((p) => `${p.x},${p.y}`).join(" ");
+  const avgScore = Math.round(scores.reduce((a, b) => a + b, 0) / 4);
+  const fillColor = getColor(avgScore);
+
+  return (
+    <div className="flex flex-col items-center">
+      <svg width={140} height={140} viewBox="0 0 140 140" className="flex-shrink-0">
+        {/* Grid circles at 25, 50, 75, 100 */}
+        {[25, 50, 75, 100].map((pct) => (
+          <circle
+            key={pct}
+            cx={cx}
+            cy={cy}
+            r={R * (pct / 100)}
+            fill="none"
+            stroke="#E2E8F0"
+            strokeWidth={0.5}
+          />
+        ))}
+        {/* Axis lines */}
+        {labels.map((_, i) => {
+          const p = toPoint(100, i);
+          return (
+            <line
+              key={i}
+              x1={cx}
+              y1={cy}
+              x2={p.x}
+              y2={p.y}
+              stroke="#E2E8F0"
+              strokeWidth={0.8}
+            />
+          );
+        })}
+        {/* Benchmark outline (85) */}
+        <polygon
+          points={benchPoly}
+          fill="none"
+          stroke="#94A3B8"
+          strokeWidth={1}
+          strokeDasharray="4 2"
+          opacity={0.8}
+        />
+        {/* Data polygon */}
+        <polygon
+          points={dataPoly}
+          fill={fillColor}
+          fillOpacity={0.35}
+          stroke={fillColor}
+          strokeWidth={2}
+        />
+      </svg>
+      <span className="text-[10px] text-text-muted mt-1 text-center">Score profile</span>
+    </div>
+  );
+}
+
 // ── Main Component ─────────────────────────────────────────────────
 
 export default function Home() {
@@ -492,29 +576,43 @@ export default function Home() {
             {result.firmName} · Generated {result.generatedAt.toLocaleDateString()}
           </p>
         </div>
-        <div className="flex items-center gap-5">
-          {/* Overall Gauge */}
-          <div className="flex flex-col items-center">
-            <svg width={140} height={140} className="flex-shrink-0">
-              <circle cx={70} cy={70} r={58} fill="none" stroke="#E2E8F0" strokeWidth={10} />
-              <circle
-                cx={70} cy={70} r={58} fill="none"
-                stroke={getScoreColor(animatedScore)}
-                strokeWidth={10} strokeLinecap="round"
-                strokeDasharray={2 * Math.PI * 58}
-                strokeDashoffset={2 * Math.PI * 58 * (1 - animatedScore / 100)}
-                transform="rotate(-90 70 70)"
-                style={{ transition: "stroke-dashoffset 0.3s ease" }}
-              />
-              <text x={70} y={64} textAnchor="middle" className="text-2xl font-bold fill-quanto-navy">{animatedScore}</text>
-              <text x={70} y={82} textAnchor="middle" className="text-sm fill-text-muted">/100</text>
-            </svg>
-            <span className="text-sm font-semibold mt-1" style={{ color: getGradeColor(result.overallGrade) }}>
-              Grade: {result.overallGrade}
-            </span>
+        <div className="flex items-center gap-6 flex-wrap">
+          {/* Radar (spider) chart — 4 dimensions */}
+          <RadarChart
+            scores={[
+              result.dataQualityScore,
+              result.acquisitionRiskScore,
+              result.automationPotentialScore,
+              result.scaleReadinessScore,
+            ]}
+            labels={["Book Quality", "Operational Risk", "Automation Fit", "Scale Readiness"]}
+            getColor={getScoreColor}
+          />
+          {/* Overall grade + benchmark */}
+          <div className="flex flex-col items-center gap-1">
+            <div className="flex flex-col items-center">
+              <svg width={100} height={100} className="flex-shrink-0">
+                <circle cx={50} cy={50} r={42} fill="none" stroke="#E2E8F0" strokeWidth={8} />
+                <circle
+                  cx={50} cy={50} r={42} fill="none"
+                  stroke={getScoreColor(animatedScore)}
+                  strokeWidth={8} strokeLinecap="round"
+                  strokeDasharray={2 * Math.PI * 42}
+                  strokeDashoffset={2 * Math.PI * 42 * (1 - animatedScore / 100)}
+                  transform="rotate(-90 50 50)"
+                  style={{ transition: "stroke-dashoffset 0.3s ease" }}
+                />
+                <text x={50} y={52} textAnchor="middle" className="text-xl font-bold fill-quanto-navy">{result.overallGrade}</text>
+              </svg>
+              <span className="text-xs text-text-muted mt-0.5">Current grade</span>
+            </div>
+            <div className="text-center mt-1 pt-1 border-t border-border-subtle">
+              <span className="text-[10px] uppercase tracking-widest text-text-muted">Target</span>
+              <p className="text-sm font-semibold text-quanto-teal">B (acquisition-ready)</p>
+            </div>
           </div>
           {/* Back button */}
-          <button type="button" onClick={() => { setResult(null); setAiNarrative(null); }} className="text-text-muted hover:text-quanto-navy text-sm underline">
+          <button type="button" onClick={() => { setResult(null); setAiNarrative(null); }} className="text-text-muted hover:text-quanto-navy text-sm underline self-center">
             New Analysis
           </button>
         </div>
@@ -563,6 +661,40 @@ export default function Home() {
         </div>
       </section>
 
+      {/* Anomaly mix — where the pain is (horizontal bars by manual fix time) */}
+      {anomalyGroups.length > 0 && (
+        <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(1.5)}>
+          <h2 className="text-lg font-semibold text-quanto-navy mb-2">Where the effort goes</h2>
+          <p className="text-sm text-text-muted mb-4">Manual fix time by issue type.</p>
+          <div className="bg-card border border-border-subtle rounded-2xl p-5 shadow-sm">
+            <div className="space-y-3">
+              {(() => {
+                const maxMins = Math.max(...anomalyGroups.map((g) => g.totalMins), 1);
+                return anomalyGroups.map((grp) => {
+                  const pct = maxMins > 0 ? (grp.totalMins / maxMins) * 100 : 0;
+                  const barColor =
+                    grp.maxSeverity === "high" ? "#E63946" : grp.maxSeverity === "medium" ? "#F4A261" : "#64748B";
+                  return (
+                    <div key={grp.type} className="flex items-center gap-3">
+                      <span className="text-sm font-medium text-quanto-navy w-[180px] shrink-0 truncate" title={grp.label}>
+                        {grp.label}
+                      </span>
+                      <div className="flex-1 h-6 bg-surface rounded overflow-hidden min-w-[80px]">
+                        <div
+                          className="h-full rounded transition-all duration-500"
+                          style={{ width: `${pct}%`, backgroundColor: barColor }}
+                        />
+                      </div>
+                      <span className="text-xs text-text-muted w-16 shrink-0 text-right">{formatHoursMins(grp.totalMins)}</span>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* Stat Row */}
       <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(2)}>
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
@@ -589,6 +721,48 @@ export default function Home() {
           ))}
         </div>
       </section>
+
+      {/* Financial exposure breakdown — horizontal bars */}
+      {(() => {
+        const apTotal = result.anomalies.filter((a) => a.type === "ap_aging").reduce((s, a) => s + a.dollarExposure, 0);
+        const arTotal = result.anomalies.filter((a) => a.type === "ar_aging").reduce((s, a) => s + a.dollarExposure, 0);
+        const dupTotal = result.anomalies.filter((a) => a.type === "duplicate").reduce((s, a) => s + a.dollarExposure, 0);
+        const exposureRows = [
+          { label: "AP aging (unpaid bills)", value: apTotal, color: "#E63946" },
+          { label: "AR aging (uncollected)", value: arTotal, color: "#F4A261" },
+          { label: "Duplicate exposure", value: dupTotal, color: "#64748B" },
+        ].filter((r) => r.value > 0);
+        const cleanup = result.cleanupCostEstimate;
+        if (cleanup > 0) exposureRows.push({ label: "Cleanup cost (est.)", value: cleanup, color: "#0A9396" });
+        const maxVal = Math.max(...exposureRows.map((r) => r.value), 1);
+        return exposureRows.length > 0 ? (
+          <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(2.5)}>
+            <h2 className="text-lg font-semibold text-quanto-navy mb-2">Financial exposure breakdown</h2>
+            <p className="text-sm text-text-muted mb-4">Where the money is at risk or tied up.</p>
+            <div className="bg-card border border-border-subtle rounded-2xl p-5 shadow-sm">
+              <div className="space-y-3">
+                {exposureRows.map((row) => {
+                  const pct = (row.value / maxVal) * 100;
+                  return (
+                    <div key={row.label} className="flex items-center gap-3">
+                      <span className="text-sm font-medium text-quanto-navy w-[200px] shrink-0 truncate">{row.label}</span>
+                      <div className="flex-1 h-6 bg-surface rounded overflow-hidden min-w-[80px]">
+                        <div
+                          className="h-full rounded transition-all duration-500"
+                          style={{ width: `${pct}%`, backgroundColor: row.color }}
+                        />
+                      </div>
+                      <span className="text-xs font-medium text-quanto-navy w-20 shrink-0 text-right">
+                        ${row.value.toLocaleString()}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </section>
+        ) : null;
+      })()}
 
       {/* Anomaly Table */}
       <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(3)}>
@@ -665,9 +839,39 @@ export default function Home() {
         </div>
       </section>
 
-      {/* Account Health Grid */}
+      {/* Account Health — bar strip + grid */}
       <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(4)}>
-        <h2 className="text-lg font-semibold text-quanto-navy mb-4">Account Health</h2>
+        <h2 className="text-lg font-semibold text-quanto-navy mb-2">Account Health</h2>
+        {/* Compact bar strip: lag by account */}
+        {result.accounts.length > 0 && (() => {
+          const maxLag = Math.max(...result.accounts.map((a) => a.avgLagDays), 1);
+          return (
+            <div className="bg-card border border-border-subtle rounded-2xl p-4 shadow-sm mb-4">
+              <p className="text-xs uppercase tracking-widest text-text-muted mb-3">Reconciliation lag by account</p>
+              <div className="space-y-2">
+                {result.accounts.map((acc) => {
+                  const pct = maxLag > 0 ? (acc.avgLagDays / maxLag) * 100 : 0;
+                  const barColor =
+                    acc.status === "healthy" ? "#2D9B5A" : acc.status === "warning" ? "#F4A261" : "#E63946";
+                  return (
+                    <div key={acc.accountName} className="flex items-center gap-3">
+                      <span className="text-sm font-medium text-quanto-navy w-[140px] shrink-0 truncate">{acc.accountName}</span>
+                      <div className="flex-1 h-5 bg-surface rounded overflow-hidden min-w-[60px]">
+                        <div
+                          className="h-full rounded transition-all duration-300"
+                          style={{ width: `${Math.max(pct, 2)}%`, backgroundColor: barColor }}
+                        />
+                      </div>
+                      <span className="text-xs text-text-muted w-12 shrink-0 text-right">{acc.avgLagDays}d</span>
+                      <span className="text-xs text-text-muted w-10 shrink-0 text-right">{acc.openIssues} issues</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
+        <p className="text-sm text-text-muted mb-4">Click a card for details.</p>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {result.accounts.map((acc) => (
             <div
@@ -721,6 +925,38 @@ export default function Home() {
           </div>
           <p className="text-quanto-teal font-semibold mt-3">
             Time saved: {formatHoursMins(result.topIssue.timeSavedMins)} — estimated value: ${Math.round((result.topIssue.timeSavedMins / 60) * 45).toLocaleString()} at $45/hr
+          </p>
+        </div>
+      </section>
+
+      {/* Time recovery — Today vs with Quanto */}
+      <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(5.2)}>
+        <h2 className="text-lg font-semibold text-quanto-navy mb-2">Time recovery</h2>
+        <p className="text-sm text-text-muted mb-4">Manual effort today vs with Quanto.</p>
+        <div className="bg-card border border-border-subtle rounded-2xl p-6 shadow-sm">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div>
+              <p className="text-xs uppercase tracking-widest text-text-muted mb-1">Manual effort today</p>
+              <div className="h-8 bg-surface rounded overflow-hidden">
+                <div
+                  className="h-full rounded bg-score-red flex items-center justify-end pr-2"
+                  style={{ width: `${Math.min(100, (result.hoursLostPerMonth / 40) * 100)}%` }}
+                >
+                  <span className="text-xs font-bold text-white">{result.hoursLostPerMonth} hrs/mo</span>
+                </div>
+              </div>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-widest text-text-muted mb-1">With Quanto</p>
+              <div className="h-8 bg-surface rounded overflow-hidden">
+                <div className="h-full w-full max-w-[15%] rounded bg-score-green flex items-center justify-center">
+                  <span className="text-xs font-bold text-white">&lt;1 hr</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p className="text-quanto-teal font-semibold mt-4 text-center">
+            ~${result.projectedAnnualSavings.toLocaleString()}/year recoverable at $45/hr
           </p>
         </div>
       </section>
