@@ -69,24 +69,32 @@ export interface TopIssue extends Anomaly {
 export interface ScorecardResult {
   firmName: string;
   generatedAt: Date;
-  mode: "buyer" | "seller";
+  /** Display: Book Quality */
   dataQualityScore: number;
-  /** labeled 'Valuation Risk' in seller mode UI only */
+  /** Display: Operational Risk (higher = lower risk) */
   acquisitionRiskScore: number;
+  /** Display: Automation Fit */
   automationPotentialScore: number;
-  marginExpansionScore: number;
+  /** Display: Scale Readiness */
+  scaleReadinessScore: number;
   overallGrade: "A" | "B" | "C" | "D";
   scoreBreakdowns: ScoreBreakdown[];
   accounts: AccountHealth[];
   anomalies: Anomaly[];
   topIssue: TopIssue;
-  /** AP aging total + AR aging total */
+  /** Deterministic value narrative by grade band */
+  valueProfile: { gradeBand: "A" | "B" | "C" | "D"; headline: string; narrative: string };
   liabilityExposure: number;
-  /** total manual fix mins / 60 * 150 */
   cleanupCostEstimate: number;
   hoursLostPerMonth: number;
+  /** Annual hours recovered (hoursLostPerMonth * 12) */
+  estimatedAnnualTimeRecoveryHours: number;
+  /** Annual margin recovery at $45/hr */
   projectedAnnualSavings: number;
+  hiddenFinancialExposure?: number;
   aiNarrative: string | null;
+  aiSummaryStatus?: "idle" | "loading" | "done" | "error";
+  dateRangeDays?: number;
 }
 
 export type PanelType = "score" | "anomaly" | "account" | "stat";
@@ -102,12 +110,15 @@ export interface StatPayload {
   explanation: string;
   relatedAnomalies?: Anomaly[];
   relatedAccounts?: AccountHealth[];
+  /** Full result for stat panel breakdowns (per-account, by-type, formulas) */
+  result?: ScorecardResult;
 }
 
 export interface SampleDefinition {
   id: string;
   firmName: string;
   description: string;
-  grade: "A" | "B" | "C" | "D";
+  /** Optional; when absent, grade is computed at load time via buildScorecard */
+  grade?: "A" | "B" | "C" | "D";
   transactions: QBOTransaction[];
 }

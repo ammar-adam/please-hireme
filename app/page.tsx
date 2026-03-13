@@ -1,6 +1,15 @@
 "use client";
 
-import { useRef, useState, useEffect, useCallback, Fragment } from "react";
+/**
+ * Quanto Pre-Acquisition Diagnostics
+ *
+ * Founder demo flow:
+ * 1. Cedar Table Restaurant — clean books, low risk; value story = preserve quality at scale, protect margins (Grade A).
+ * 2. Lakeview Bookkeeping Co. — moderate friction; value story = standardize workflows, unlock capacity (Grade B or C).
+ * 3. Maple Advisory Group — messy target; value story = de-risk onboarding, reduce cleanup burden (Grade D).
+ * Grades are computed from scoring; no hardcoded badges. AI memo loads in background and is cached per firm.
+ */
+import { useRef, useState, useEffect, useCallback, useMemo, Fragment } from "react";
 import Papa from "papaparse";
 import { buildScorecard, parseTransactions } from "@/lib/scorecard";
 import { ALL_SAMPLES, transactionsToCSV } from "@/lib/samples";
@@ -23,6 +32,20 @@ function formatHoursMins(totalMins: number): string {
   const m = Math.round(totalMins % 60);
   if (h === 0) return `${m} mins`;
   return `${h} hrs ${m} mins`;
+}
+
+/** Escape HTML so we can safely inject text; then restore ** as <strong> for display. */
+function renderTextWithBold(text: string): string {
+  const escape = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts
+    .map((p) => {
+      const m = p.match(/^\*\*(.+)\*\*$/);
+      if (m) return "<strong>" + escape(m[1]) + "</strong>";
+      return escape(p);
+    })
+    .join("");
 }
 
 function getScoreColor(score: number): string {
@@ -61,7 +84,7 @@ const QUANTO_FIX_DESCRIPTIONS: Record<string, string> = {
 };
 
 const SEVERITY_ORDER = { high: 0, medium: 1, low: 2 };
-type SortKey = "type" | "account" | "count" | "dollarExposure" | "manualFixMins" | "severity";
+type SampleWithGrade = SampleDefinition & { computedGrade: "A" | "B" | "C" | "D" };
 
 // ── Main Component ─────────────────────────────────────────────────
 
@@ -72,22 +95,33 @@ export default function Home() {
   const [parseError, setParseError] = useState<string | null>(null);
   const [lastTransactions, setLastTransactions] = useState<QBOTransaction[] | null>(null);
   const [lastFirmName, setLastFirmName] = useState<string | null>(null);
-  const [currentMode, setCurrentMode] = useState<"buyer" | "seller">("buyer");
   const [panelOpen, setPanelOpen] = useState(false);
   const [panelContext, setPanelContext] = useState<PanelContext | null>(null);
   const [previewSample, setPreviewSample] = useState<SampleDefinition | null>(null);
+  const [previewShowAll, setPreviewShowAll] = useState(false);
   const [animatedScore, setAnimatedScore] = useState(0);
-  const [modeFlash, setModeFlash] = useState(false);
-  const [anomalySort, setAnomalySort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({ key: "severity", dir: "desc" });
+
+  // Compute grade for each sample at load so card badge matches dashboard
+  const samplesWithGrades = useMemo(
+    (): SampleWithGrade[] =>
+      ALL_SAMPLES.map((s) => ({
+        ...s,
+        computedGrade: buildScorecard(s.transactions, s.firmName).overallGrade,
+      })),
+    []
+  );
+  const [expandedAnomalyGroups, setExpandedAnomalyGroups] = useState<Set<string>>(new Set());
   const [aiNarrative, setAiNarrative] = useState<string | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState(false);
   const [dashboardMounted, setDashboardMounted] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const aiMemoCacheRef = useRef<Map<string, string>>(new Map());
 
   // Animated score counter
   useEffect(() => {
     if (!result) return;
-    const scores = [result.dataQualityScore, result.acquisitionRiskScore, result.automationPotentialScore, result.marginExpansionScore];
+    const scores = [result.dataQualityScore, result.acquisitionRiskScore, result.automationPotentialScore, result.scaleReadinessScore];
     const target = Math.round(scores.reduce((a, b) => a + b, 0) / 4);
     const duration = 1200;
     const start = performance.now();
@@ -112,6 +146,57 @@ export default function Home() {
     }
   }, [result]);
 
+  // Background AI narrative: start when result is set; use cache so sample re-load is instant
+  useEffect(() => {
+    if (!result) return;
+    setAiError(false);
+    const cached = aiMemoCacheRef.current.get(result.firmName);
+    if (cached) {
+      setAiNarrative(cached);
+      setAiLoading(false);
+      return;
+    }
+    setAiNarrative(null);
+    let cancelled = false;
+    setAiLoading(true);
+    const payload = { ...result, generatedAt: result.generatedAt.toISOString?.() ?? result.generatedAt };
+    fetch("/api/narrative", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+      .then((res) => {
+        if (!res.ok) {
+          if (!cancelled) setAiError(true);
+          return null;
+        }
+        if (cancelled) return null;
+        return res.body?.getReader();
+      })
+      .then((reader) => {
+        if (!reader || cancelled) return "";
+        const decoder = new TextDecoder();
+        let text = "";
+        return reader.read().then(function pump(chunk): Promise<string> {
+          if (chunk.done) return Promise.resolve(text);
+          if (cancelled) return Promise.resolve(text);
+          text += decoder.decode(chunk.value, { stream: true });
+          return reader.read().then(pump);
+        });
+      })
+      .then((text) => {
+        if (cancelled) return;
+        setAiLoading(false);
+        if (text) {
+          aiMemoCacheRef.current.set(result.firmName, text);
+          setAiNarrative(text);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAiLoading(false);
+          setAiError(true);
+        }
+      });
+    return () => { cancelled = true; };
+  }, [result?.firmName]);
+
   const openPanel = useCallback((ctx: PanelContext) => {
     setPanelContext(ctx);
     setPanelOpen(true);
@@ -134,7 +219,7 @@ export default function Home() {
           const rows = (parsed.data ?? []) as Record<string, string>[];
           const transactions = parseTransactions(rows);
           const name = filenameToFirmName(file.name);
-          const scorecard = buildScorecard(transactions, name, currentMode);
+          const scorecard = buildScorecard(transactions, name);
           setResult(scorecard);
           setLastTransactions(transactions);
           setLastFirmName(name);
@@ -162,25 +247,13 @@ export default function Home() {
     setParseError(null);
     setLoading(true);
     setTimeout(() => {
-      const scorecard = buildScorecard(sample.transactions, sample.firmName, currentMode);
+      const scorecard = buildScorecard(sample.transactions, sample.firmName);
       setResult(scorecard);
       setLastTransactions(sample.transactions);
       setLastFirmName(sample.firmName);
-      setAiNarrative(null);
       setLoading(false);
+      // AI narrative starts in background via useEffect
     }, 100);
-  };
-
-  const toggleMode = (newMode: "buyer" | "seller") => {
-    if (newMode === currentMode) return;
-    setCurrentMode(newMode);
-    if (lastTransactions && lastFirmName) {
-      const scorecard = buildScorecard(lastTransactions, lastFirmName, newMode);
-      setResult(scorecard);
-      setAiNarrative(null);
-      setModeFlash(true);
-      setTimeout(() => setModeFlash(false), 600);
-    }
   };
 
   const generateNarrative = async () => {
@@ -214,25 +287,39 @@ export default function Home() {
     setAiLoading(false);
   };
 
-  const sortedAnomalies: Anomaly[] = result
-    ? [...result.anomalies].sort((a, b) => {
-        const k = anomalySort.key;
-        if (k === "severity") {
-          const diff = SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity];
-          return anomalySort.dir === "desc" ? diff : -diff;
-        }
-        if (k === "type" || k === "account") {
-          const cmp = String(a[k]).localeCompare(String(b[k]));
-          return anomalySort.dir === "desc" ? -cmp : cmp;
-        }
-        const va = k === "dollarExposure" ? a.dollarExposure : k === "manualFixMins" ? a.manualFixMins : a.count;
-        const vb = k === "dollarExposure" ? b.dollarExposure : k === "manualFixMins" ? b.manualFixMins : b.count;
-        return anomalySort.dir === "desc" ? vb - va : va - vb;
-      })
-    : [];
+  const anomalyGroups = useMemo(() => {
+    if (!result) return [];
+    const byType = new Map<string, Anomaly[]>();
+    for (const a of result.anomalies) {
+      const list = byType.get(a.type) ?? [];
+      list.push(a);
+      byType.set(a.type, list);
+    }
+    return Array.from(byType.entries()).map(([type, anomalies]) => {
+      const totalCount = anomalies.reduce((s, x) => s + x.count, 0);
+      const totalMins = anomalies.reduce((s, x) => s + x.manualFixMins, 0);
+      const maxSeverity = (["high", "medium", "low"] as const).reduce(
+        (best, sev) => (anomalies.some((x) => x.severity === sev) && SEVERITY_ORDER[sev] < SEVERITY_ORDER[best] ? sev : best),
+        "low" as const
+      );
+      return {
+        type,
+        label: ISSUE_TYPE_LABELS[type as AnomalyType],
+        totalCount,
+        totalMins,
+        maxSeverity: anomalies.some((x) => x.severity === "high") ? "high" : anomalies.some((x) => x.severity === "medium") ? "medium" : "low",
+        anomalies,
+      };
+    }).sort((a, b) => SEVERITY_ORDER[b.maxSeverity as keyof typeof SEVERITY_ORDER] - SEVERITY_ORDER[a.maxSeverity as keyof typeof SEVERITY_ORDER] || a.label.localeCompare(b.label));
+  }, [result]);
 
-  const toggleSort = (key: SortKey) => {
-    setAnomalySort((prev) => ({ key, dir: prev.key === key && prev.dir === "desc" ? "asc" : "desc" }));
+  const toggleAnomalyGroup = (type: string) => {
+    setExpandedAnomalyGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      return next;
+    });
   };
 
   // ── Upload Screen ──────────────────────────────────────────────
@@ -242,20 +329,22 @@ export default function Home() {
       <div className="min-h-screen flex flex-col items-center justify-center bg-surface p-6">
         <div className="text-center mb-10">
           <h1 className="text-3xl font-bold text-quanto-teal">Quanto</h1>
-          <p className="text-quanto-navy text-sm tracking-widest uppercase mt-1">Firm Health Scorecard</p>
+          <p className="text-quanto-navy text-sm tracking-widest uppercase mt-1">Pre-Acquisition Diagnostics</p>
         </div>
 
+        <p className="text-quanto-navy font-medium mb-3 max-w-4xl w-full">Try a sample firm instead</p>
+        <p className="text-text-muted text-sm mb-4 max-w-4xl w-full">No upload required. Click Load &amp; Analyze to see the full diagnostic.</p>
         {/* Sample Cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 max-w-4xl w-full mb-8">
-          {ALL_SAMPLES.map((sample) => (
+          {samplesWithGrades.map((sample) => (
             <div key={sample.id} className="bg-card border border-border-subtle rounded-2xl p-5 shadow-sm flex flex-col">
               <div className="flex items-center justify-between mb-2">
                 <h3 className="font-semibold text-quanto-navy text-sm">{sample.firmName}</h3>
                 <span
                   className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold"
-                  style={{ backgroundColor: getGradeColor(sample.grade) }}
+                  style={{ backgroundColor: getGradeColor(sample.computedGrade) }}
                 >
-                  {sample.grade}
+                  {sample.computedGrade}
                 </span>
               </div>
               <p className="text-text-muted text-xs mb-4 flex-1">{sample.description}</p>
@@ -311,8 +400,8 @@ export default function Home() {
               <svg className="w-12 h-12 mx-auto text-border-subtle mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
               </svg>
-              <p className="text-quanto-navy font-medium">Drop a QuickBooks export (.csv)</p>
-              <p className="text-text-muted text-sm mt-1">or click to browse files</p>
+              <p className="text-quanto-navy font-medium">Upload a QuickBooks export to uncover accounting risk, workflow inefficiencies, and automation opportunities.</p>
+              <p className="text-text-muted text-sm mt-1">or click to browse · Try a sample firm instead (no upload required)</p>
             </>
           )}
         </div>
@@ -320,16 +409,18 @@ export default function Home() {
 
         {/* Preview Modal */}
         {previewSample && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setPreviewSample(null)}>
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => { setPreviewSample(null); setPreviewShowAll(false); }}>
             <div className="bg-card rounded-2xl shadow-xl max-w-4xl w-full mx-4 max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
               <div className="flex items-center justify-between p-5 border-b border-border-subtle">
                 <div>
                   <h3 className="font-semibold text-quanto-navy">{previewSample.firmName} — CSV Preview</h3>
-                  <p className="text-text-muted text-xs mt-1">Showing 20 of {previewSample.transactions.length} rows</p>
+                  <p className="text-text-muted text-xs mt-1">
+                    {previewShowAll ? `Showing all ${previewSample.transactions.length} rows` : `Showing 20 of ${previewSample.transactions.length} rows`}
+                  </p>
                 </div>
                 <button type="button" onClick={() => setPreviewSample(null)} className="text-text-muted hover:text-quanto-navy text-xl">&times;</button>
               </div>
-              <div className="overflow-auto flex-1 p-4">
+              <div className={`overflow-auto flex-1 p-4 ${previewShowAll ? "max-h-[600px]" : ""}`}>
                 <table className="w-full text-xs">
                   <thead>
                     <tr className="border-b border-border-subtle text-left text-[10px] uppercase tracking-widest text-text-muted">
@@ -345,7 +436,7 @@ export default function Home() {
                     </tr>
                   </thead>
                   <tbody>
-                    {previewSample.transactions.slice(0, 20).map((t) => (
+                    {(previewShowAll ? previewSample.transactions : previewSample.transactions.slice(0, 20)).map((t) => (
                       <tr key={t.id} className="border-b border-border-subtle/50">
                         <td className="py-1.5 pr-3 whitespace-nowrap">{t.date.toLocaleDateString()}</td>
                         <td className="py-1.5 pr-3">{t.transactionType}</td>
@@ -360,6 +451,15 @@ export default function Home() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+              <div className="p-3 border-t border-border-subtle">
+                <button
+                  type="button"
+                  onClick={() => setPreviewShowAll((v) => !v)}
+                  className="text-sm font-medium text-quanto-teal hover:underline"
+                >
+                  {previewShowAll ? `Show first 20 rows` : `Show all ${previewSample.transactions.length} rows`}
+                </button>
               </div>
             </div>
           </div>
@@ -381,37 +481,18 @@ export default function Home() {
     transition: `opacity 0.4s ease ${i * 100}ms, transform 0.4s ease ${i * 100}ms`,
   });
 
-  const flashClass = modeFlash ? "animate-pulse ring-2 ring-quanto-teal/30" : "";
-
   return (
     <div className="min-h-screen bg-surface text-quanto-navy">
       {/* Header */}
       <section className="border-b border-border-subtle bg-card px-8 py-6 flex flex-wrap items-center justify-between gap-6" style={stagger(0)}>
         <div>
           <p className="text-quanto-teal font-bold text-sm">Quanto</p>
-          <h1 className="text-2xl font-bold text-quanto-navy mt-1">{result.firmName}</h1>
+          <h1 className="text-2xl font-bold text-quanto-navy mt-1">Quanto Pre-Acquisition Diagnostics</h1>
           <p className="text-text-muted text-sm mt-1">
-            Generated {result.generatedAt.toLocaleDateString()} · {currentMode === "buyer" ? "Acquisition Due Diligence" : "Firm Improvement Report"}
+            {result.firmName} · Generated {result.generatedAt.toLocaleDateString()}
           </p>
         </div>
         <div className="flex items-center gap-5">
-          {/* Mode Toggle */}
-          <div className="flex rounded-full overflow-hidden border border-border-subtle bg-surface">
-            <button
-              type="button"
-              onClick={() => toggleMode("buyer")}
-              className={`px-4 py-2 text-sm font-medium transition-colors ${currentMode === "buyer" ? "bg-quanto-navy text-white" : "text-quanto-navy hover:bg-quanto-teal-bg"}`}
-            >
-              Buyer View
-            </button>
-            <button
-              type="button"
-              onClick={() => toggleMode("seller")}
-              className={`px-4 py-2 text-sm font-medium transition-colors ${currentMode === "seller" ? "bg-quanto-navy text-white" : "text-quanto-navy hover:bg-quanto-teal-bg"}`}
-            >
-              Seller View
-            </button>
-          </div>
           {/* Overall Gauge */}
           <div className="flex flex-col items-center">
             <svg width={140} height={140} className="flex-shrink-0">
@@ -444,17 +525,21 @@ export default function Home() {
         <h2 className="text-lg font-semibold text-quanto-navy mb-4">Score Breakdown</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {[
-            { label: "Data Quality", score: result.dataQualityScore, idx: 0 },
-            { label: currentMode === "seller" ? "Valuation Risk" : "Acquisition Risk", score: result.acquisitionRiskScore, idx: 1 },
-            { label: "Automation Potential", score: result.automationPotentialScore, idx: 2 },
-            { label: "Margin Expansion", score: result.marginExpansionScore, idx: 3 },
+            { label: "Book Quality", score: result.dataQualityScore, idx: 0 },
+            { label: "Operational Risk", score: result.acquisitionRiskScore, idx: 1 },
+            { label: "Automation Fit", score: result.automationPotentialScore, idx: 2 },
+            { label: "Scale Readiness", score: result.scaleReadinessScore, idx: 3 },
           ].map(({ label, score, idx }) => {
             const r = 36;
             const c = 2 * Math.PI * r;
             return (
               <div
                 key={label}
-                className={`bg-card border border-border-subtle rounded-2xl p-6 shadow-sm cursor-pointer hover:border-quanto-teal/40 transition-all ${flashClass}`}
+                className="bg-card border border-border-subtle rounded-2xl shadow-sm cursor-pointer hover:border-quanto-teal/40 transition-all"
+                style={{
+                  padding: "24px",
+                  borderLeft: `4px solid ${getScoreColor(score)}`,
+                }}
                 onClick={() => openPanel({ type: "score", payload: result.scoreBreakdowns[idx] })}
               >
                 <p className="text-[11px] uppercase tracking-widest text-text-muted">{label}</p>
@@ -480,21 +565,22 @@ export default function Home() {
 
       {/* Stat Row */}
       <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(2)}>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
           {[
             { name: "Avg Reconciliation Lag", value: `${avgLag} days`, raw: avgLag, explanation: `Average reconciliation lag across ${result.accounts.length} accounts is ${avgLag} days.` },
             { name: "Total Anomalies", value: String(totalAnomalies), raw: totalAnomalies, explanation: `${totalAnomalies} total anomalies detected across ${result.anomalies.length} issue groups.` },
             { name: "Hours Lost / Month", value: `${result.hoursLostPerMonth} hrs`, raw: result.hoursLostPerMonth, explanation: `Estimated ${result.hoursLostPerMonth} hours per month spent on manual fixes.` },
-            { name: "Projected Annual Savings", value: `$${result.projectedAnnualSavings.toLocaleString()}`, raw: result.projectedAnnualSavings, explanation: `At $150/hr, eliminating ${result.hoursLostPerMonth} hrs/month saves $${result.projectedAnnualSavings.toLocaleString()}/year.` },
-            { name: "Liability Exposure", value: `$${result.liabilityExposure.toLocaleString()}`, raw: result.liabilityExposure, explanation: `AP aging + AR aging totals $${result.liabilityExposure.toLocaleString()}.` },
-            { name: "Cleanup Cost Estimate", value: `$${result.cleanupCostEstimate.toLocaleString()}`, raw: result.cleanupCostEstimate, explanation: `Total manual fix time: ${(result.cleanupCostEstimate / 150).toFixed(0)} hours at $150/hr.` },
+            { name: "Estimated Annual Time Recovery", value: `${result.estimatedAnnualTimeRecoveryHours} hrs`, raw: result.estimatedAnnualTimeRecoveryHours, explanation: `Annualized hours reclaimed from reducing repetitive bookkeeping work: ${result.hoursLostPerMonth} hrs/month × 12 = ${result.estimatedAnnualTimeRecoveryHours} hrs/year.` },
+            { name: "Estimated Annual Margin Recovery", value: `$${result.projectedAnnualSavings.toLocaleString()}`, raw: result.projectedAnnualSavings, explanation: `Annualized labor value recovered: ${result.hoursLostPerMonth} hrs/month × $45/hr × 12 = $${result.projectedAnnualSavings.toLocaleString()}/year.` },
+            { name: "Hidden Financial Exposure", value: `$${(result.hiddenFinancialExposure ?? result.liabilityExposure).toLocaleString()}`, raw: result.hiddenFinancialExposure ?? result.liabilityExposure, explanation: `Duplicate value + AP aging + AR aging: $${(result.hiddenFinancialExposure ?? result.liabilityExposure).toLocaleString()} in flagged exposure.` },
+            { name: "Cleanup Cost Estimate", value: `$${result.cleanupCostEstimate.toLocaleString()}`, raw: result.cleanupCostEstimate, explanation: `Estimated cost to resolve all flagged issues at bookkeeping rate: ${(result.cleanupCostEstimate / 45).toFixed(0)} hours × $45/hr.` },
           ].map((stat) => (
             <div
               key={stat.name}
-              className={`bg-card border border-border-subtle rounded-2xl p-4 shadow-sm cursor-pointer hover:border-quanto-teal/40 transition ${flashClass}`}
+              className="bg-card border border-border-subtle rounded-2xl p-4 shadow-sm cursor-pointer hover:border-quanto-teal/40 hover:shadow-md transition flex-1 min-w-0"
               onClick={() => openPanel({
                 type: "stat",
-                payload: { name: stat.name, value: stat.value, explanation: stat.explanation, relatedAnomalies: result.anomalies } as StatPayload,
+                payload: { name: stat.name, value: stat.value, explanation: stat.explanation, relatedAnomalies: result.anomalies, result } as StatPayload,
               })}
             >
               <p className="text-[11px] uppercase tracking-widest text-text-muted">{stat.name}</p>
@@ -507,54 +593,72 @@ export default function Home() {
       {/* Anomaly Table */}
       <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(3)}>
         <h2 className="text-lg font-semibold text-quanto-navy mb-1">Anomaly Breakdown</h2>
+        <p className="text-sm text-text-muted mb-1">Click any row for details.</p>
         <p className="text-sm text-text-muted mb-4">
-          {currentMode === "buyer"
-            ? "Every flagged item is a risk you inherit. Click any row for details."
-            : "Every flagged item is suppressing your valuation. Click to see what needs fixing."}
+          Each anomaly represents hidden operational or financial risk.
         </p>
         <div className="overflow-x-auto">
           <table className="w-full bg-card border border-border-subtle rounded-2xl overflow-hidden shadow-sm">
             <thead>
               <tr className="bg-surface border-b border-border-subtle">
-                {[
-                  { key: "type" as SortKey, label: "Issue Type" },
-                  { key: "account" as SortKey, label: "Account" },
-                  { key: "count" as SortKey, label: "Count" },
-                  { key: "manualFixMins" as SortKey, label: "Manual Fix Time" },
-                  { key: "dollarExposure" as SortKey, label: "Dollar Impact" },
-                  { key: "severity" as SortKey, label: "Severity" },
-                ].map(({ key, label }) => (
-                  <th
-                    key={key}
-                    className="text-left py-3 px-4 text-[10px] uppercase tracking-widest text-text-muted cursor-pointer select-none"
-                    onClick={() => toggleSort(key)}
-                  >
-                    {label}
-                    {anomalySort.key === key && <span className="ml-1">{anomalySort.dir === "desc" ? "\u2193" : "\u2191"}</span>}
-                  </th>
-                ))}
+                <th className="text-left py-3 px-4 text-[10px] uppercase tracking-widest text-text-muted">Issue Type</th>
+                <th className="text-left py-3 px-4 text-[10px] uppercase tracking-widest text-text-muted">Account</th>
+                <th className="text-left py-3 px-4 text-[10px] uppercase tracking-widest text-text-muted">Count</th>
+                <th className="text-left py-3 px-4 text-[10px] uppercase tracking-widest text-text-muted">Manual Fix Time</th>
+                <th className="text-left py-3 px-4 text-[10px] uppercase tracking-widest text-text-muted">Dollar Impact</th>
+                <th className="text-left py-3 px-4 text-[10px] uppercase tracking-widest text-text-muted">Severity</th>
               </tr>
             </thead>
-            <tbody>
-              {sortedAnomalies.map((a) => (
-                <tr
-                  key={a.id}
-                  className="border-b border-border-subtle cursor-pointer hover:bg-quanto-teal-bg/50 transition-colors"
-                  onClick={() => openPanel({ type: "anomaly", payload: a })}
-                >
-                  <td className="py-3 px-4 text-sm">{ISSUE_TYPE_LABELS[a.type] ?? a.type}</td>
-                  <td className="py-3 px-4 text-sm">{a.account}</td>
-                  <td className="py-3 px-4 text-sm">{a.count}</td>
-                  <td className="py-3 px-4 text-sm">{formatHoursMins(a.manualFixMins)}</td>
-                  <td className="py-3 px-4 text-sm">{a.dollarExposure > 0 ? `$${a.dollarExposure.toLocaleString()}` : "—"}</td>
-                  <td className="py-3 px-4">
-                    <span className={`inline-block px-2 py-1 rounded text-xs font-medium ${
-                      a.severity === "high" ? "bg-score-red-bg text-score-red" :
-                      a.severity === "medium" ? "bg-score-amber-bg text-score-amber" :
-                      "bg-surface text-text-muted"
-                    }`}>{a.severity}</span>
-                  </td>
-                </tr>
+            <tbody className="[&_tr:nth-child(odd)]:bg-[#F8F9FA] [&_tr:nth-child(even)]:bg-white">
+              {anomalyGroups.map((grp) => (
+                <Fragment key={grp.type}>
+                  <tr
+                    className="border-b border-border-subtle cursor-pointer hover:bg-quanto-teal-bg/40 transition-colors"
+                    onClick={(e) => { e.stopPropagation(); toggleAnomalyGroup(grp.type); }}
+                  >
+                    <td className="py-3 px-4 text-sm font-medium">
+                      <span className="inline-flex items-center gap-2">
+                        <span className="text-quanto-navy">{expandedAnomalyGroups.has(grp.type) ? "\u25BC" : "\u25B6"}</span>
+                        {grp.label}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-sm text-text-muted">—</td>
+                    <td className="py-3 px-4 text-sm">{grp.totalCount} total</td>
+                    <td className="py-3 px-4 text-sm">{formatHoursMins(grp.totalMins)}</td>
+                    <td className="py-3 px-4 text-sm">
+                      {grp.anomalies.reduce((s, a) => s + a.dollarExposure, 0) > 0
+                        ? `$${grp.anomalies.reduce((s, a) => s + a.dollarExposure, 0).toLocaleString()}`
+                        : "—"}
+                    </td>
+                    <td className="py-3 px-4">
+                      <span className={`inline-block px-2 py-1 rounded-full text-xs font-medium ${
+                        grp.maxSeverity === "high" ? "bg-score-red text-white" :
+                        grp.maxSeverity === "medium" ? "bg-score-amber text-white" :
+                        "bg-text-muted text-white"
+                      }`}>{grp.maxSeverity}</span>
+                    </td>
+                  </tr>
+                  {expandedAnomalyGroups.has(grp.type) && grp.anomalies.map((a) => (
+                    <tr
+                      key={a.id}
+                      className="border-b border-border-subtle/50 cursor-pointer hover:bg-quanto-teal-bg/50 transition-colors"
+                      onClick={() => openPanel({ type: "anomaly", payload: a })}
+                    >
+                      <td className="py-2 px-4 pl-8 text-sm text-text-muted">└</td>
+                      <td className="py-2 px-4 text-sm">{a.account}</td>
+                      <td className="py-2 px-4 text-sm">{a.count}</td>
+                      <td className="py-2 px-4 text-sm">{formatHoursMins(a.manualFixMins)}</td>
+                      <td className="py-2 px-4 text-sm">{a.dollarExposure > 0 ? `$${a.dollarExposure.toLocaleString()}` : "—"}</td>
+                      <td className="py-2 px-4">
+                        <span className={`inline-block px-2 py-1 rounded-full text-xs font-medium ${
+                          a.severity === "high" ? "bg-score-red text-white" :
+                          a.severity === "medium" ? "bg-score-amber text-white" :
+                          "bg-text-muted text-white"
+                        }`}>{a.severity}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </Fragment>
               ))}
             </tbody>
           </table>
@@ -568,7 +672,11 @@ export default function Home() {
           {result.accounts.map((acc) => (
             <div
               key={acc.accountName}
-              className="bg-card border border-border-subtle rounded-2xl p-5 shadow-sm cursor-pointer hover:border-quanto-teal/40 transition"
+              className="bg-card border border-border-subtle rounded-2xl p-5 shadow-sm cursor-pointer hover:border-quanto-teal/40 transition overflow-hidden"
+              style={{
+                borderTopWidth: 4,
+                borderTopColor: acc.status === "healthy" ? "#2D9B5A" : acc.status === "warning" ? "#F4A261" : "#E63946",
+              }}
               onClick={() => openPanel({ type: "account", payload: acc })}
             >
               <div className="flex justify-between items-start">
@@ -589,53 +697,64 @@ export default function Home() {
         </div>
       </section>
 
-      {/* Top Issue Callout */}
+      {/* Top Operational Issue */}
       <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(5)}>
         <div className="border-l-4 border-quanto-teal bg-quanto-teal-bg rounded-2xl p-6">
           <div className="flex justify-between items-start">
-            <p className="text-[11px] uppercase tracking-widest text-quanto-teal font-semibold">Top Priority Issue</p>
+            <p className="text-[11px] uppercase tracking-widest text-quanto-teal font-semibold">Top Operational Issue</p>
             <span className={`px-2 py-1 rounded text-xs font-medium ${
               result.topIssue.severity === "high" ? "bg-score-red-bg text-score-red" :
               result.topIssue.severity === "medium" ? "bg-score-amber-bg text-score-amber" :
               "bg-surface text-text-muted"
             }`}>{result.topIssue.severity}</span>
           </div>
-          <p className="text-lg font-medium text-quanto-navy mt-2">{result.topIssue.plainEnglishDescription}</p>
-          <div className="grid grid-cols-2 gap-4 mt-4">
-            <div>
+          <p className="text-[18px] font-bold text-quanto-navy mt-2 leading-snug">{result.topIssue.plainEnglishDescription}</p>
+          <div className="grid grid-cols-2 gap-6 mt-6 border-t border-border-subtle pt-6">
+            <div className="pr-4 border-r border-border-subtle">
               <p className="text-sm text-text-muted">Manual Fix Time</p>
-              <p className="text-score-red font-bold">{formatHoursMins(result.topIssue.manualFixMins)}</p>
+              <p className="text-score-red font-bold mt-1">{formatHoursMins(result.topIssue.manualFixMins)}</p>
             </div>
-            <div>
+            <div className="pl-4">
               <p className="text-sm text-text-muted">With Quanto</p>
-              <p className="text-score-green font-bold">{result.topIssue.quantoFixTime}</p>
+              <p className="text-score-green font-bold mt-1">{result.topIssue.quantoFixTime}</p>
             </div>
           </div>
           <p className="text-quanto-teal font-semibold mt-3">
-            Time saved: {formatHoursMins(result.topIssue.timeSavedMins)} — estimated value: ${Math.round((result.topIssue.timeSavedMins / 60) * 150).toLocaleString()}
+            Time saved: {formatHoursMins(result.topIssue.timeSavedMins)} — estimated value: ${Math.round((result.topIssue.timeSavedMins / 60) * 45).toLocaleString()} at $45/hr
           </p>
         </div>
       </section>
 
-      {/* AI Narrative */}
-      <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(6)}>
-        <h2 className="text-lg font-semibold text-quanto-navy mb-4">AI Firm Diagnosis</h2>
-        {!aiNarrative && !aiLoading && (
-          <button
-            type="button"
-            onClick={generateNarrative}
-            className="px-6 py-3 bg-quanto-navy text-white rounded-xl font-semibold hover:opacity-90 transition"
-          >
-            Generate Firm Diagnosis
-          </button>
-        )}
-        {(aiNarrative || aiLoading) && (
-          <div className="bg-card border border-border-subtle rounded-2xl p-8 shadow-sm">
-            <div className="prose prose-sm max-w-none text-quanto-navy leading-relaxed whitespace-pre-wrap">
-              {aiNarrative}
-              {aiLoading && <span className="inline-block w-0.5 h-4 bg-quanto-teal ml-0.5 animate-pulse" />}
-            </div>
+      {/* How Quanto Creates Value Here — deterministic by grade band */}
+      {result.valueProfile && (
+        <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(5.5)}>
+          <h2 className="text-lg font-semibold text-quanto-navy mb-3">How Quanto Creates Value Here</h2>
+          <div className="bg-quanto-teal-bg border border-quanto-teal/30 rounded-2xl p-6">
+            <p className="text-quanto-teal font-semibold text-sm uppercase tracking-widest">{result.valueProfile.headline}</p>
+            <p className="text-quanto-navy mt-2 leading-relaxed" dangerouslySetInnerHTML={{ __html: renderTextWithBold(result.valueProfile.narrative) }} />
           </div>
+        </section>
+      )}
+
+      {/* AI Narrative — backgrounded; report is complete without it */}
+      <section className="max-w-6xl mx-auto px-4 py-6" style={stagger(6)}>
+        <h2 className="text-lg font-semibold text-quanto-navy mb-4">AI Diagnostic Memo</h2>
+        {aiLoading && (
+          <div className="bg-card border border-border-subtle rounded-2xl p-6 shadow-sm flex items-center gap-3">
+            <span className="inline-block w-5 h-5 border-2 border-quanto-teal border-t-transparent rounded-full animate-spin" />
+            <p className="text-text-muted text-sm">Generating AI memo…</p>
+          </div>
+        )}
+        {aiNarrative && !aiLoading && (
+          <div className="bg-card border border-border-subtle rounded-2xl p-8 shadow-sm">
+            <div className="prose prose-sm max-w-none text-quanto-navy leading-relaxed whitespace-pre-wrap" dangerouslySetInnerHTML={{ __html: renderTextWithBold(aiNarrative) }} />
+          </div>
+        )}
+        {!aiNarrative && !aiLoading && !aiError && (
+          <p className="text-text-muted text-sm">AI memo will appear here when generation completes. The report above is complete without it.</p>
+        )}
+        {aiError && !aiLoading && (
+          <p className="text-text-muted text-sm">AI memo unavailable (check DEEPSEEK_API_KEY in .env.local). The report above is complete without it.</p>
         )}
       </section>
 
@@ -652,7 +771,7 @@ export default function Home() {
       </section>
 
       {/* Side Panel */}
-      <SidePanel open={panelOpen} context={panelContext} onClose={() => setPanelOpen(false)} mode={currentMode} />
+      <SidePanel open={panelOpen} context={panelContext} onClose={() => setPanelOpen(false)} />
     </div>
   );
 }
@@ -663,12 +782,10 @@ function SidePanel({
   open,
   context,
   onClose,
-  mode,
 }: {
   open: boolean;
   context: PanelContext | null;
   onClose: () => void;
-  mode: "buyer" | "seller";
 }) {
   return (
     <>
@@ -683,7 +800,7 @@ function SidePanel({
           open ? "translate-x-0" : "translate-x-full"
         }`}
       >
-        <div className="flex items-center justify-between p-5 border-b border-border-subtle sticky top-0 bg-card z-10">
+        <div className="flex items-center justify-between p-7 border-b border-border-subtle sticky top-0 bg-card z-10">
           <h3 className="font-semibold text-quanto-navy">
             {context?.type === "score" && (context.payload as ScoreBreakdown).category}
             {context?.type === "anomaly" && `${ISSUE_TYPE_LABELS[(context.payload as Anomaly).type]} — ${(context.payload as Anomaly).account}`}
@@ -705,18 +822,18 @@ function SidePanel({
 function ScorePanelContent({ breakdown }: { breakdown: ScoreBreakdown }) {
   const allTxns = breakdown.affectedAnomalies.flatMap((a) => a.affectedTransactions);
   return (
-    <div className="p-5 space-y-6">
+    <div className="p-7 space-y-6">
       <div>
-        <h4 className="text-[11px] uppercase tracking-widest text-text-muted mb-2">What This Measures</h4>
+        <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">What This Measures</h4>
         <p className="text-sm text-quanto-navy">This score evaluates the {breakdown.category.toLowerCase()} dimension of the firm's books.</p>
       </div>
-      <div>
-        <h4 className="text-[11px] uppercase tracking-widest text-text-muted mb-2">Exact Math</h4>
+      <div className="border-l-2 border-quanto-teal pl-4">
+        <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Exact Math</h4>
         <p className="text-sm text-quanto-navy leading-relaxed">{breakdown.explanation}</p>
       </div>
       {allTxns.length > 0 && (
         <div>
-          <h4 className="text-[11px] uppercase tracking-widest text-text-muted mb-2">Affected Transactions</h4>
+          <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Affected Transactions</h4>
           <TransactionTable transactions={allTxns} />
         </div>
       )}
@@ -726,19 +843,19 @@ function ScorePanelContent({ breakdown }: { breakdown: ScoreBreakdown }) {
 
 function AnomalyPanelContent({ anomaly }: { anomaly: Anomaly }) {
   return (
-    <div className="p-5 space-y-6">
+    <div className="p-7 space-y-6">
       <div>
-        <h4 className="text-[11px] uppercase tracking-widest text-text-muted mb-2">Analysis</h4>
+        <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Why This Was Flagged</h4>
         <p className="text-sm text-quanto-navy leading-relaxed">{anomaly.mathExplanation}</p>
       </div>
       {anomaly.affectedTransactions.length > 0 && (
         <div>
-          <h4 className="text-[11px] uppercase tracking-widest text-text-muted mb-2">Affected Transactions</h4>
+          <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Affected Transactions</h4>
           <TransactionTable transactions={anomaly.affectedTransactions} />
         </div>
       )}
       <div>
-        <h4 className="text-[11px] uppercase tracking-widest text-text-muted mb-2">What Quanto Does</h4>
+        <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">What Quanto Does</h4>
         <p className="text-sm text-quanto-teal">{QUANTO_FIX_DESCRIPTIONS[anomaly.type] ?? "Quanto automates detection and resolution of this issue."}</p>
       </div>
     </div>
@@ -747,7 +864,7 @@ function AnomalyPanelContent({ anomaly }: { anomaly: Anomaly }) {
 
 function AccountPanelContent({ account }: { account: AccountHealth }) {
   return (
-    <div className="p-5 space-y-6">
+    <div className="p-7 space-y-6">
       <div className="flex items-center gap-3">
         <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
           account.status === "healthy" ? "bg-score-green-bg text-score-green" :
@@ -757,14 +874,22 @@ function AccountPanelContent({ account }: { account: AccountHealth }) {
       </div>
       <div>
         <p className="text-sm text-quanto-navy leading-relaxed">
-          This account {account.status === "critical" ? "needs immediate attention" : account.status === "warning" ? "shows moderate risk" : "is in good shape"}.
-          Average reconciliation lag is {account.avgLagDays} days. Last activity was {account.daysSinceLastTransaction} days ago.
-          There are {account.openIssues} open issues ({account.duplicateCount} duplicates, {account.unreconciledCount} unreconciled, {account.miscategorizedCount} miscategorized).
+          {account.status === "critical"
+            ? "This account needs immediate attention."
+            : account.status === "warning"
+            ? "This account shows moderate risk."
+            : account.openIssues > 0
+            ? "This account is generally healthy but has open issues to resolve."
+            : "This account is in good shape."}
+          {" "}Average reconciliation lag is {account.avgLagDays} days. Last activity was {account.daysSinceLastTransaction} days ago.
+          {account.openIssues > 0 && (
+            <> {account.openIssues} open issues ({account.duplicateCount} duplicates, {account.unreconciledCount} unreconciled, {account.miscategorizedCount} miscategorized).</>
+          )}
         </p>
       </div>
       {account.affectedTransactions.length > 0 && (
         <div>
-          <h4 className="text-[11px] uppercase tracking-widest text-text-muted mb-2">Recent Transactions</h4>
+          <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Recent Transactions</h4>
           <TransactionTable transactions={account.affectedTransactions.slice(0, 20)} />
         </div>
       )}
@@ -773,15 +898,174 @@ function AccountPanelContent({ account }: { account: AccountHealth }) {
 }
 
 function StatPanelContent({ stat }: { stat: StatPayload }) {
+  const r = stat.result;
+  const totalFixMins = r?.anomalies ? r.anomalies.reduce((s, a) => s + a.manualFixMins, 0) : 0;
+  const dateRangeDays = r?.dateRangeDays ?? 1;
+  const byType = r?.anomalies
+    ? (["duplicate", "unreconciled", "miscategorized", "ap_aging", "ar_aging", "owner_dependency", "round_number", "balance_jump"] as const).map((type) => ({
+        type,
+        label: ISSUE_TYPE_LABELS[type],
+        count: r!.anomalies.filter((a) => a.type === type).length,
+      })).filter((x) => x.count > 0)
+    : [];
+  const apTotal = r?.anomalies?.filter((a) => a.type === "ap_aging").reduce((s, a) => s + a.dollarExposure, 0) ?? 0;
+  const arTotal = r?.anomalies?.filter((a) => a.type === "ar_aging").reduce((s, a) => s + a.dollarExposure, 0) ?? 0;
+  const apCount = r?.anomalies?.filter((a) => a.type === "ap_aging").length ?? 0;
+  const arCount = r?.anomalies?.filter((a) => a.type === "ar_aging").length ?? 0;
+  const LAG_THRESHOLD = 3;
+
   return (
-    <div className="p-5 space-y-6">
+    <div className="p-7 space-y-6">
       <div>
         <p className="text-3xl font-bold text-quanto-navy">{stat.value}</p>
       </div>
-      <div>
-        <h4 className="text-[11px] uppercase tracking-widest text-text-muted mb-2">How This Was Calculated</h4>
-        <p className="text-sm text-quanto-navy leading-relaxed">{stat.explanation}</p>
-      </div>
+      {stat.name === "Avg Reconciliation Lag" && (
+        <>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Explanation</h4>
+            <p className="text-sm text-quanto-navy leading-relaxed">
+              Average number of days between a transaction occurring and the account balance being updated. Industry standard is under 3 days.
+            </p>
+          </div>
+          {r?.accounts && r.accounts.length > 0 && (
+            <div>
+              <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Breakdown by account</h4>
+              <div className="border border-border-subtle rounded-lg overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead className="bg-surface">
+                    <tr className="text-left text-[10px] uppercase tracking-widest text-text-muted">
+                      <th className="py-2 px-3">Account</th>
+                      <th className="py-2 px-3 text-right">Avg lag (days)</th>
+                      <th className="py-2 px-3"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {r.accounts.map((acc) => (
+                      <tr key={acc.accountName} className="border-t border-border-subtle">
+                        <td className="py-2 px-3">{acc.accountName}</td>
+                        <td className="py-2 px-3 text-right">{acc.avgLagDays}</td>
+                        <td className="py-2 px-3">
+                          {acc.avgLagDays > LAG_THRESHOLD && (
+                            <span className="text-score-amber text-xs font-medium">Above threshold</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+      {stat.name === "Total Anomalies" && (
+        <>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Explanation</h4>
+            <p className="text-sm text-quanto-navy leading-relaxed">
+              Total number of flagged issues across all detection categories.
+            </p>
+          </div>
+          {byType.length > 0 && (
+            <div>
+              <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Breakdown by type</h4>
+              <ul className="space-y-1 text-sm text-quanto-navy">
+                {byType.map(({ type, label, count }) => (
+                  <li key={type}>{label}: {count}</li>
+                ))}
+              </ul>
+              <p className="text-xs text-text-muted mt-2">Click any row in the Anomaly Breakdown table for details.</p>
+            </div>
+          )}
+        </>
+      )}
+      {stat.name === "Hours Lost / Month" && (
+        <>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Explanation</h4>
+            <p className="text-sm text-quanto-navy leading-relaxed">
+              Estimated manual hours your team spends each month resolving these issues. Calculated from total fix minutes across all anomalies, normalized to a 30-day window.
+            </p>
+          </div>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Formula</h4>
+            <p className="text-sm text-quanto-navy font-mono">
+              Total fix minutes: {totalFixMins}. Date range: {dateRangeDays} days. Normalized to 30 days: {totalFixMins} / {dateRangeDays} × 30 / 60 = {r?.hoursLostPerMonth ?? 0} hrs/month.
+            </p>
+          </div>
+        </>
+      )}
+      {stat.name === "Estimated Annual Time Recovery" && (
+        <>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Explanation</h4>
+            <p className="text-sm text-quanto-navy leading-relaxed">
+              Annualized hours that could be reclaimed by reducing repetitive bookkeeping work through automation. Time is normalized to a 12-month window from the current monthly estimate.
+            </p>
+          </div>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Formula</h4>
+            <p className="text-sm text-quanto-navy font-mono">
+              {r?.hoursLostPerMonth ?? 0} hrs/month × 12 = {r?.estimatedAnnualTimeRecoveryHours ?? 0} hrs/year
+            </p>
+          </div>
+        </>
+      )}
+      {stat.name === "Estimated Annual Margin Recovery" && (
+        <>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Explanation</h4>
+            <p className="text-sm text-quanto-navy leading-relaxed">
+              Annualized value of reclaiming wasted hours through automation. What the firm could recover in margin by letting Quanto handle the manual work.
+            </p>
+          </div>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Formula</h4>
+            <p className="text-sm text-quanto-navy font-mono">
+              {r?.hoursLostPerMonth ?? 0} hrs/month × 12 months × $45/hr = ${r?.projectedAnnualSavings?.toLocaleString() ?? "0"}/year
+            </p>
+          </div>
+        </>
+      )}
+      {stat.name === "Hidden Financial Exposure" && (
+        <>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Explanation</h4>
+            <p className="text-sm text-quanto-navy leading-relaxed">
+              Aggregated economic exposure: duplicate transaction value plus AP aging plus AR aging. Money at risk or requiring cleanup.
+            </p>
+          </div>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Breakdown</h4>
+            <p className="text-sm text-quanto-navy">
+              AP aging total ${apTotal.toLocaleString()} ({apCount} items). AR aging total ${arTotal.toLocaleString()} ({arCount} items). Duplicate and other flagged exposure included in total.
+            </p>
+            <p className="text-xs text-text-muted mt-2">In an acquisition, unpaid AP transfers to the buyer.</p>
+          </div>
+        </>
+      )}
+      {stat.name === "Cleanup Cost Estimate" && (
+        <>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Explanation</h4>
+            <p className="text-sm text-quanto-navy leading-relaxed">
+              Estimated cost to manually resolve all flagged issues at bookkeeping labor rate ($45/hr).
+            </p>
+          </div>
+          <div>
+            <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">Formula</h4>
+            <p className="text-sm text-quanto-navy font-mono">
+              Total manual fix minutes: {totalFixMins}. {totalFixMins} / 60 × $45 = ${r?.cleanupCostEstimate?.toLocaleString() ?? "0"}
+            </p>
+          </div>
+        </>
+      )}
+      {!["Avg Reconciliation Lag", "Total Anomalies", "Hours Lost / Month", "Estimated Annual Time Recovery", "Estimated Annual Margin Recovery", "Hidden Financial Exposure", "Cleanup Cost Estimate"].includes(stat.name) && (
+        <div>
+          <h4 className="text-[10px] uppercase tracking-widest text-quanto-teal font-semibold mb-2">How This Was Calculated</h4>
+          <p className="text-sm text-quanto-navy leading-relaxed">{stat.explanation}</p>
+        </div>
+      )}
     </div>
   );
 }

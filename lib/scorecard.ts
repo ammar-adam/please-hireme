@@ -6,8 +6,18 @@ import type {
   ScoreBreakdown,
   ScorecardResult,
 } from "./types";
+import { buildValueProfile } from "./valueProfile";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+/** Bookkeeping labor rate for cleanup cost and margin recovery ($/hr) */
+const HOURLY_RATE = 45;
+
+/** Known software/platform vendors to avoid flagging as owner dependency */
+const PLATFORM_NAMES = new Set([
+  "stripe", "shopify", "salesforce", "adobe", "aws", "google", "microsoft", "quickbooks",
+  "xero", "bell canada", "rogers", "td bank", "rbc", "cibc", "scotiabank", "bmo", "wework",
+  "uber", "uber eats", "fedex", "ups", "amazon",
+]);
 
 function daysBetween(d1: Date, d2: Date): number {
   const a = new Date(d1.getFullYear(), d1.getMonth(), d1.getDate());
@@ -65,19 +75,31 @@ export function parseTransactions(
 
 // ── Owner Name Extraction ──────────────────────────────────────────
 
+/** Returns at most 2 names with meaningful concentration risk: explicit owner/founder or very high share of tx. */
 export function extractOwnerNames(transactions: QBOTransaction[]): string[] {
   const nameCounts = new Map<string, number>();
   for (const t of transactions) {
     const n = t.name.trim();
     if (!n) continue;
+    const key = n.toLowerCase();
+    if (PLATFORM_NAMES.has(key)) continue;
     nameCounts.set(n, (nameCounts.get(n) ?? 0) + 1);
   }
-  const threshold = transactions.length * 0.08;
-  const owners: string[] = [];
-  for (const [name, count] of nameCounts) {
-    if (count >= threshold) owners.push(name);
-  }
-  return owners;
+  const total = transactions.length;
+  const minCountExplicit = Math.max(6, Math.floor(total * 0.05)); // 5%+ with explicit keyword
+  const minCountConcentration = Math.max(10, Math.floor(total * 0.10)); // 10%+ without keyword (single name)
+  const suspiciousKeywords = /owner|founder|personal\s+draw|withdrawal|draw|salary|payroll/i;
+  const overThreshold = [...nameCounts.entries()]
+    .filter(([name, count]) => {
+      const hasKeyword = suspiciousKeywords.test(name);
+      if (hasKeyword && count >= minCountExplicit) return true;
+      if (!hasKeyword && count >= minCountConcentration && name.split(/\s+/).length <= 4 && !/[0-9]/.test(name)) return true;
+      return false;
+    })
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .map(([name]) => name);
+  return overThreshold;
 }
 
 // ── Detectors ──────────────────────────────────────────────────────
@@ -185,11 +207,14 @@ export function detectMiscategorized(transactions: QBOTransaction[]): Anomaly[] 
   const anomalies: Anomaly[] = [];
   for (const [account, list] of byAccount) {
     const dollarExposure = list.reduce((s, t) => s + Math.abs(t.amount), 0);
-    const blankCount = list.filter((t) => t.name.trim() === "").length;
-    const uncatCount = list.filter((t) => t.account.toLowerCase().includes("uncategorized")).length;
-    const parts: string[] = [];
-    if (blankCount > 0) parts.push(`${blankCount} with blank vendor name`);
-    if (uncatCount > 0) parts.push(`${uncatCount} in Uncategorized Expense`);
+    const blankVendor = list.filter((t) => t.name.trim() === "");
+    const uncat = list.filter((t) => t.account.toLowerCase().includes("uncategorized"));
+    const noMemoLarge = list.filter((t) => t.memo.trim() === "" && Math.abs(t.amount) > 500);
+    const reasonParts: string[] = [];
+    if (blankVendor.length > 0) reasonParts.push(`blank vendor name (${blankVendor.length})`);
+    if (uncat.length > 0) reasonParts.push(`uncategorized expense account (${uncat.length})`);
+    if (noMemoLarge.length > 0) reasonParts.push(`no memo on amount > $500 (${noMemoLarge.length})`);
+    const why = reasonParts.length > 0 ? ` Reason codes: ${reasonParts.join("; ")}.` : "";
     anomalies.push({
       id: nextAnomalyId("miscategorized"),
       type: "miscategorized",
@@ -199,7 +224,7 @@ export function detectMiscategorized(transactions: QBOTransaction[]): Anomaly[] 
       manualFixMins: list.length * 12,
       dollarExposure,
       severity: "low",
-      mathExplanation: `${list.length} miscategorized transactions on ${account}: ${parts.join(", ")}. Total exposure: ${fmt$(dollarExposure)}. Each takes ~12 minutes to review and recategorize.`,
+      mathExplanation: `${list.length} transactions on ${account} need review.${why} Consequence: inconsistent books and slower close. Quanto auto-categorizes from vendor history and flags exceptions.`,
     });
   }
   return anomalies;
@@ -281,37 +306,65 @@ export function detectARAging(
   ];
 }
 
+/** Single summarized concentration anomaly: one per firm, not one per name. */
 export function detectOwnerDependency(
   transactions: QBOTransaction[],
   ownerNames: string[]
 ): Anomaly[] {
-  const anomalies: Anomaly[] = [];
+  if (ownerNames.length === 0) return [];
+  const allAffected: QBOTransaction[] = [];
+  const namesSeen: string[] = [];
   for (const ownerName of ownerNames) {
     const affected = transactions.filter(
       (t) => t.name.trim().toLowerCase() === ownerName.trim().toLowerCase()
     );
-    if (affected.length === 0) continue;
-    const pct = ((affected.length / transactions.length) * 100).toFixed(0);
-    anomalies.push({
+    if (affected.length > 0) {
+      allAffected.push(...affected);
+      namesSeen.push(ownerName);
+    }
+  }
+  if (allAffected.length === 0) return [];
+  const totalCount = allAffected.length;
+  const pct = ((totalCount / transactions.length) * 100).toFixed(0);
+  const dollarExposure = allAffected.reduce((s, t) => s + Math.abs(t.amount), 0);
+  const nameList = namesSeen.length <= 2 ? namesSeen.join(" and ") : `${namesSeen[0]} and ${namesSeen.length - 1} other(s)`;
+  return [
+    {
       id: nextAnomalyId("owner_dependency"),
       type: "owner_dependency",
       account: "All Accounts",
-      count: affected.length,
-      affectedTransactions: affected,
-      manualFixMins: affected.length * 5,
-      dollarExposure: affected.reduce((s, t) => s + Math.abs(t.amount), 0),
-      severity: "high",
-      mathExplanation: `${ownerName} appears in ${pct}% of all transactions (${affected.length} of ${transactions.length}). This signals key-man dependency that increases acquisition risk.`,
-    });
-  }
-  return anomalies;
+      count: totalCount,
+      affectedTransactions: allAffected,
+      manualFixMins: totalCount * 5,
+      dollarExposure,
+      severity: totalCount > 20 ? "high" : totalCount > 10 ? "medium" : "low",
+      mathExplanation: `Key-person concentration: ${nameList} appears in ${pct}% of transactions (${totalCount} of ${transactions.length}). This signals dependency risk that can complicate acquisition or handoff.`,
+    },
+  ];
 }
 
+/** Flags credible suspicious round-number patterns: outflow only; exact $1000 multiples ≥$2000, or same amount ≥$2000 repeated 3+ times. */
 export function detectRoundNumbers(transactions: QBOTransaction[]): Anomaly[] {
+  const typeLower = (t: QBOTransaction) => t.transactionType.trim().toLowerCase();
+  const isOutflow = (t: QBOTransaction) => {
+    const type = typeLower(t);
+    return type !== "deposit" && type !== "invoice" && type !== "payment";
+  };
+  const outflow = transactions.filter(isOutflow);
+  const ROUND_MIN = 2000;
+  const amountCounts = new Map<number, number>();
+  for (const t of outflow) {
+    const amt = Math.round(Math.abs(t.amount) * 100) / 100;
+    if (amt < ROUND_MIN) continue;
+    amountCounts.set(amt, (amountCounts.get(amt) ?? 0) + 1);
+  }
   const byAccount = new Map<string, QBOTransaction[]>();
-  for (const t of transactions) {
+  for (const t of outflow) {
     const amt = Math.abs(t.amount);
-    if (amt < 1000 || amt % 500 !== 0) continue;
+    const isRound1000 = amt >= ROUND_MIN && amt % 1000 === 0;
+    const repeatCount = amountCounts.get(Math.round(amt * 100) / 100) ?? 0;
+    const isRepeatedLarge = amt >= ROUND_MIN && repeatCount >= 3;
+    if (!isRound1000 && !isRepeatedLarge) continue;
     const key = t.account || "(blank)";
     if (!byAccount.has(key)) byAccount.set(key, []);
     byAccount.get(key)!.push(t);
@@ -325,16 +378,17 @@ export function detectRoundNumbers(transactions: QBOTransaction[]): Anomaly[] {
       type: "round_number",
       account,
       count: list.length,
-      affectedTransactions: list,
-      manualFixMins: list.length * 10,
+      affectedTransactions: [...list],
+      manualFixMins: Math.min(list.length * 10, 60),
       dollarExposure: 0,
       severity: "low",
-      mathExplanation: `${list.length} transactions on ${account} are exact multiples of $500 over $1,000 (${examples}). These may be manual estimates rather than actual invoiced amounts.`,
+      mathExplanation: `${list.length} expense transactions on ${account} are unusually large round numbers (≥$2,000) or repeated identical amounts (${examples}). May be estimates without support; Quanto flags these for invoice verification.`,
     });
   }
   return anomalies;
 }
 
+/** Unexplained large balance movements; at most one per account, capped impact. */
 export function detectBalanceJumps(transactions: QBOTransaction[]): Anomaly[] {
   const byAccount = new Map<string, QBOTransaction[]>();
   for (const t of transactions) {
@@ -345,46 +399,48 @@ export function detectBalanceJumps(transactions: QBOTransaction[]): Anomaly[] {
   }
 
   const anomalies: Anomaly[] = [];
+  const JUMP_MIN = 15000; // only flag large, credible jumps
   for (const [account, list] of byAccount) {
     if (list.length < 2) continue;
     const sorted = [...list].sort((a, b) => a.date.getTime() - b.date.getTime());
     const jumpTxns: QBOTransaction[] = [];
-    const jumpDetails: string[] = [];
+    let bestDiff = 0;
+    let bestDetail = "";
 
     for (let i = 1; i < sorted.length; i++) {
       const prev = sorted[i - 1];
       const curr = sorted[i];
       const diff = Math.abs(curr.balance! - prev.balance!);
-      if (diff < 5000) continue;
+      if (diff < JUMP_MIN) continue;
 
-      // Check if any single transaction within 2 days accounts for the change
       const jumpDate = curr.date;
       const hasMatch = transactions.some((t) => {
         if (t.account !== account) return false;
-        const withinRange = Math.abs(daysBetween(t.date, jumpDate)) <= 2;
+        const withinRange = Math.abs(daysBetween(t.date, jumpDate)) <= 3;
         const matchesAmount = Math.abs(Math.abs(t.amount) - diff) < 0.01;
         return withinRange && matchesAmount;
       });
 
-      if (!hasMatch) {
+      if (!hasMatch && diff > bestDiff) {
+        bestDiff = diff;
+        bestDetail = `Balance jumped by ${fmt$(diff)} on ${fmtDate(curr.date)} with no matching transaction within 3 days`;
+        jumpTxns.length = 0;
         jumpTxns.push(prev, curr);
-        jumpDetails.push(
-          `Balance jumped by ${fmt$(diff)} on ${fmtDate(curr.date)} with no matching transaction within 2 days`
-        );
       }
     }
 
-    if (jumpTxns.length > 0) {
+    if (bestDetail) {
+      const uniqueTxns = [...new Map(jumpTxns.map((t) => [t.id, t])).values()];
       anomalies.push({
         id: nextAnomalyId("balance_jump"),
         type: "balance_jump",
         account,
-        count: jumpDetails.length,
-        affectedTransactions: jumpTxns,
-        manualFixMins: jumpDetails.length * 30,
+        count: 1,
+        affectedTransactions: uniqueTxns.slice(0, 8),
+        manualFixMins: Math.min(30, 60),
         dollarExposure: 0,
         severity: "medium",
-        mathExplanation: `${account}: ${jumpDetails[0]}${jumpDetails.length > 1 ? ` (and ${jumpDetails.length - 1} more)` : ""}.`,
+        mathExplanation: `${account}: ${bestDetail}. Unexplained large movements may need reconciliation. Quanto detects these and creates reconciliation tasks.`,
       });
     }
   }
@@ -454,138 +510,133 @@ export function calculateReconciliationLag(
 }
 
 // ── Score Calculation ──────────────────────────────────────────────
+// Single unified diagnostic; no buyer/seller mode. Grades: A 85+, B 70–84, C 55–69, D <55.
 
 export function calculateScores(
   anomalies: Anomaly[],
   accounts: AccountHealth[],
   transactions: QBOTransaction[],
   hoursLostPerMonth: number,
-  mode: "buyer" | "seller"
+  cleanupCostEstimate: number,
+  dateRangeDays: number
 ): { scores: [number, number, number, number]; breakdowns: ScoreBreakdown[] } {
   const breakdowns: ScoreBreakdown[] = [];
+  const SCORE_FLOOR = 10;
+  const MAX_BOOK_QUALITY_DEDUCTION = 50;
+  // Per-category caps so one detector doesn't dominate; account-normalized feel
+  const CAP_DUPLICATE_PTS = 14;   // ~7 pairs
+  const CAP_UNRECONCILED_PTS = 18;
+  const CAP_MISCAT_PTS = 10;
+  const CAP_ROUND_PTS = 5;
 
-  // ── Data Quality ──
-  let dqRaw = 100;
-  let dqPenalty = 0;
-  const dqParts: string[] = [];
-  const dqAnomalies: Anomaly[] = [];
+  // ── Book Quality (higher = better) ──
+  let dupPts = 0, unrecPts = 0, miscPts = 0, roundPts = 0;
+  const bqAnomalies: Anomaly[] = [];
   for (const a of anomalies) {
-    let pts = 0;
-    if (a.type === "duplicate") pts = 3 * a.count;
-    else if (a.type === "unreconciled") pts = 2 * a.count;
-    else if (a.type === "miscategorized") pts = 1.5 * a.count;
-    else if (a.type === "round_number") pts = 2 * a.count;
-    if (pts > 0) {
-      dqPenalty += pts;
-      dqAnomalies.push(a);
-      dqParts.push(
-        `Deducted ${pts} points for ${a.count} ${a.type.replace("_", " ")} issue${a.count > 1 ? "s" : ""} (${a.type === "duplicate" ? "3" : a.type === "unreconciled" ? "2" : a.type === "miscategorized" ? "1.5" : "2"}pts each)`
-      );
-    }
+    if (a.type === "duplicate") { dupPts += 2 * a.count; bqAnomalies.push(a); }
+    else if (a.type === "unreconciled") { unrecPts += a.count; bqAnomalies.push(a); }
+    else if (a.type === "miscategorized") { miscPts += a.count; bqAnomalies.push(a); }
+    else if (a.type === "round_number") { roundPts += a.count; bqAnomalies.push(a); }
   }
-  const dataQualityScore = Math.max(0, Math.round(dqRaw - dqPenalty));
+  dupPts = Math.min(dupPts, CAP_DUPLICATE_PTS);
+  unrecPts = Math.min(unrecPts, CAP_UNRECONCILED_PTS);
+  miscPts = Math.min(miscPts, CAP_MISCAT_PTS);
+  roundPts = Math.min(roundPts, CAP_ROUND_PTS);
+  const bqPenalty = Math.min(dupPts + unrecPts + miscPts + roundPts, MAX_BOOK_QUALITY_DEDUCTION);
+  const dataQualityScore = Math.max(SCORE_FLOOR, Math.round(100 - bqPenalty));
+  const bqParts: string[] = [];
+  if (dupPts) bqParts.push(`duplicates (${dupPts} pts)`);
+  if (unrecPts) bqParts.push(`unreconciled (${unrecPts} pts)`);
+  if (miscPts) bqParts.push(`miscategorized (${miscPts} pts)`);
+  if (roundPts) bqParts.push(`round numbers (${roundPts} pts)`);
   breakdowns.push({
-    category: "Data Quality",
-    rawScore: dqRaw,
-    penalty: Math.round(dqPenalty),
-    explanation: `Score started at ${dqRaw}. ${dqParts.length > 0 ? dqParts.join(". ") + "." : "No penalties applied — books are clean."}`,
-    affectedAnomalies: dqAnomalies,
+    category: "Book Quality",
+    rawScore: 100,
+    penalty: bqPenalty,
+    explanation: `Cleanliness and consistency of the books. Deductions: duplicate pairs -2 each (cap ${CAP_DUPLICATE_PTS}), unreconciled -1 (cap ${CAP_UNRECONCILED_PTS}), miscategorized -1 (cap ${CAP_MISCAT_PTS}), round numbers -1 (cap ${CAP_ROUND_PTS}). ${bqParts.length > 0 ? bqParts.join("; ") + "." : "No penalties — books are clean."}`,
+    affectedAnomalies: bqAnomalies,
   });
 
-  // ── Acquisition Risk ──
-  let arRaw = 100;
-  let arPenalty = 0;
-  const arParts: string[] = [];
-  const arAnomalies: Anomaly[] = [];
+  // ── Operational Risk (higher = lower risk, better) ──
+  let opPenalty = 0;
+  const opParts: string[] = [];
+  const opAnomalies: Anomaly[] = [];
   for (const a of anomalies) {
     let pts = 0;
-    if (a.type === "ap_aging") pts = 8 * Math.floor(a.dollarExposure / 5000);
-    else if (a.type === "ar_aging") pts = 6 * Math.floor(a.dollarExposure / 5000);
-    else if (a.type === "owner_dependency") pts = 10;
-    else if (a.type === "balance_jump") pts = 5;
+    if (a.type === "ap_aging") pts = Math.min(28, 2 * Math.floor(a.dollarExposure / 5000));
+    else if (a.type === "ar_aging") pts = Math.min(28, 2 * Math.floor(a.dollarExposure / 5000));
+    else if (a.type === "owner_dependency") pts = Math.min(10, 4 + Math.floor(a.count / 4)); // cap 10
+    else if (a.type === "balance_jump") pts = 4;
     if (pts > 0) {
-      arPenalty += pts;
-      arAnomalies.push(a);
-      arParts.push(`Deducted ${pts} points for ${a.type.replace("_", " ")}`);
+      opPenalty += pts;
+      opAnomalies.push(a);
+      opParts.push(`${a.type.replace("_", " ")}`);
     }
   }
-  for (const acc of accounts) {
-    if (acc.status === "critical") {
-      arPenalty += 3;
-      arParts.push(`Deducted 3 points for critical account: ${acc.accountName}`);
-    }
+  const criticalAccounts = accounts.filter((acc) => acc.status === "critical");
+  const criticalPenalty = Math.min(12, criticalAccounts.length * 4); // cap 12
+  if (criticalPenalty > 0) {
+    opPenalty += criticalPenalty;
+    opParts.push(`critical accounts (${criticalAccounts.length})`);
   }
-  const acquisitionRiskScore = Math.max(0, Math.round(arRaw - arPenalty));
+  const acquisitionRiskScore = Math.max(SCORE_FLOOR, Math.round(100 - opPenalty));
   breakdowns.push({
-    category: mode === "seller" ? "Valuation Risk" : "Acquisition Risk",
-    rawScore: arRaw,
-    penalty: Math.round(arPenalty),
-    explanation: `Score started at ${arRaw}. ${arParts.length > 0 ? arParts.join(". ") + "." : "No risk penalties — low acquisition risk."}`,
-    affectedAnomalies: arAnomalies,
+    category: "Operational Risk",
+    rawScore: 100,
+    penalty: opPenalty,
+    explanation: `Hidden bookkeeping and operational issues that create acquisition or cleanup risk. Higher score = lower risk. ${opParts.length > 0 ? "Deductions: " + opParts.join("; ") + "." : "No material risk signals."}`,
+    affectedAnomalies: opAnomalies,
   });
 
-  // ── Automation Potential ──
-  let apRaw = 40;
-  let apBonus = 0;
-  const apParts: string[] = ["Base score: 40."];
+  // ── Automation Fit (valuable even for clean firms: standardization, capacity, repeatability) ──
+  let autoBase = 50;
+  const autoParts: string[] = ["Base 50. Bonuses for automatable workload:"];
   const apAnomalies: Anomaly[] = [];
   const dupCount = anomalies.filter((a) => a.type === "duplicate").reduce((s, a) => s + a.count, 0);
   const unrecCount = anomalies.filter((a) => a.type === "unreconciled").reduce((s, a) => s + a.count, 0);
   const miscCount = anomalies.filter((a) => a.type === "miscategorized").reduce((s, a) => s + a.count, 0);
   const roundCount = anomalies.filter((a) => a.type === "round_number").reduce((s, a) => s + a.count, 0);
-  if (dupCount > 5) { apBonus += 10; apParts.push(`+10 for ${dupCount} duplicates (>5)`); apAnomalies.push(...anomalies.filter((a) => a.type === "duplicate")); }
-  if (unrecCount > 10) { apBonus += 10; apParts.push(`+10 for ${unrecCount} unreconciled (>10)`); apAnomalies.push(...anomalies.filter((a) => a.type === "unreconciled")); }
-  if (miscCount > 8) { apBonus += 10; apParts.push(`+10 for ${miscCount} miscategorized (>8)`); apAnomalies.push(...anomalies.filter((a) => a.type === "miscategorized")); }
-  if (roundCount > 5) { apBonus += 10; apParts.push(`+10 for ${roundCount} round numbers (>5)`); apAnomalies.push(...anomalies.filter((a) => a.type === "round_number")); }
-  const automationPotentialScore = Math.min(100, apRaw + apBonus);
+  if (dupCount >= 1) { autoBase += Math.min(15, dupCount * 2); autoParts.push(`duplicates (${dupCount})`); apAnomalies.push(...anomalies.filter((a) => a.type === "duplicate")); }
+  if (unrecCount >= 1) { autoBase += Math.min(15, unrecCount * 1.5); autoParts.push(`unreconciled (${unrecCount})`); apAnomalies.push(...anomalies.filter((a) => a.type === "unreconciled")); }
+  if (miscCount >= 1) { autoBase += Math.min(10, miscCount * 1.5); autoParts.push(`miscategorized (${miscCount})`); apAnomalies.push(...anomalies.filter((a) => a.type === "miscategorized")); }
+  if (roundCount >= 1) { autoBase += Math.min(8, roundCount * 2); autoParts.push(`round numbers (${roundCount})`); apAnomalies.push(...anomalies.filter((a) => a.type === "round_number")); }
+  let automationPotentialScore = Math.min(100, Math.round(autoBase));
+  // Clean firms still get value: floor so A is reachable
+  if (dataQualityScore >= 80 && acquisitionRiskScore >= 80) {
+    automationPotentialScore = Math.max(automationPotentialScore, 75);
+    autoParts.push("(floor 75 for clean firms: standardization, faster closes)");
+  }
   breakdowns.push({
-    category: "Automation Potential",
-    rawScore: apRaw,
-    penalty: -apBonus,
-    explanation: apParts.join(" ") + ` Final: ${automationPotentialScore}.`,
+    category: "Automation Fit",
+    rawScore: 50,
+    penalty: -(automationPotentialScore - 50),
+    explanation: `How much of the firm's bookkeeping maps to Quanto's automation. ${autoParts.join("; ")}. Final: ${automationPotentialScore}. Clean firms benefit from standardization and faster closes.`,
     affectedAnomalies: apAnomalies,
   });
 
-  // ── Margin Expansion ──
-  let marginExpansionScore: number;
-  const meParts: string[] = [];
-  if (mode === "seller") {
-    const totalIncome = transactions
-      .filter((t) => t.transactionType.trim().toLowerCase() === "deposit" || t.transactionType.trim().toLowerCase() === "invoice")
-      .reduce((s, t) => s + Math.abs(t.amount), 0);
-    if (totalIncome > 0) {
-      const annualCost = hoursLostPerMonth * 150 * 12;
-      const annualIncome = totalIncome * (12 / Math.max(1, transactions.length / 15));
-      marginExpansionScore = Math.min(100, Math.round((annualCost / annualIncome) * 100));
-    } else {
-      marginExpansionScore = 30;
-    }
-    meParts.push(`Based on hours lost relative to income. Score: ${marginExpansionScore}.`);
-  } else {
-    if (hoursLostPerMonth > 20) marginExpansionScore = 90;
-    else if (hoursLostPerMonth >= 10) marginExpansionScore = 70;
-    else if (hoursLostPerMonth >= 5) marginExpansionScore = 50;
-    else marginExpansionScore = 30;
-    meParts.push(`Hours lost/month: ${hoursLostPerMonth.toFixed(1)}. Score: ${marginExpansionScore}.`);
-  }
+  // ── Scale Readiness (composite) ──
+  const scaleReadinessScore = Math.max(
+    SCORE_FLOOR,
+    Math.round((dataQualityScore * 0.35 + acquisitionRiskScore * 0.35 + automationPotentialScore * 0.3))
+  );
   breakdowns.push({
-    category: "Margin Expansion",
+    category: "Scale Readiness",
     rawScore: 100,
-    penalty: 100 - marginExpansionScore,
-    explanation: meParts.join(" "),
+    penalty: 100 - scaleReadinessScore,
+    explanation: `Readiness for scaling, repeatable onboarding, and roll-up integration. Formula: 35% Book Quality + 35% Operational Risk + 30% Automation Fit.`,
     affectedAnomalies: [],
   });
 
   return {
-    scores: [dataQualityScore, acquisitionRiskScore, automationPotentialScore, marginExpansionScore],
+    scores: [dataQualityScore, acquisitionRiskScore, automationPotentialScore, scaleReadinessScore],
     breakdowns,
   };
 }
 
 export function calculateOverallGrade(
-  dq: number, ar: number, ap: number, me: number
+  dq: number, ar: number, ap: number, scale: number
 ): "A" | "B" | "C" | "D" {
-  const avg = (dq + ar + ap + me) / 4;
+  const avg = (dq + ar + ap + scale) / 4;
   if (avg >= 85) return "A";
   if (avg >= 70) return "B";
   if (avg >= 55) return "C";
@@ -596,8 +647,7 @@ export function calculateOverallGrade(
 
 export function buildScorecard(
   transactions: QBOTransaction[],
-  firmName: string,
-  mode: "buyer" | "seller" = "buyer"
+  firmName: string
 ): ScorecardResult {
   _idCounter = 0;
   const generatedAt = new Date();
@@ -635,25 +685,41 @@ export function buildScorecard(
   const arTotal = arAging.reduce((s, a) => s + a.dollarExposure, 0);
   const liabilityExposure = apTotal + arTotal;
 
-  // Cleanup cost
-  const cleanupCostEstimate = Math.round((totalManualFixMins / 60) * 150);
+  // Cleanup cost at bookkeeping rate
+  const cleanupCostEstimate = Math.round((totalManualFixMins / 60) * HOURLY_RATE);
 
-  // Projected annual savings
-  const projectedAnnualSavings = Math.round(hoursLostPerMonth * 12 * 150);
+  // Projected annual margin recovery
+  const projectedAnnualSavings = Math.round(hoursLostPerMonth * 12 * HOURLY_RATE);
 
-  // Scores
+  // Hidden financial exposure: duplicate $ + AP + AR
+  const duplicateDollars = allAnomalies.filter((a) => a.type === "duplicate").reduce((s, a) => s + a.dollarExposure, 0);
+  const hiddenFinancialExposure = duplicateDollars + apTotal + arTotal;
+
+  // Scores (unified diagnostic)
   const { scores, breakdowns } = calculateScores(
-    allAnomalies, accounts, transactions, hoursLostPerMonth, mode
+    allAnomalies,
+    accounts,
+    transactions,
+    hoursLostPerMonth,
+    cleanupCostEstimate,
+    dateRangeDays
   );
-  const [dataQualityScore, acquisitionRiskScore, automationPotentialScore, marginExpansionScore] = scores;
+  const [dataQualityScore, acquisitionRiskScore, automationPotentialScore, scaleReadinessScore] = scores;
   const overallGrade = calculateOverallGrade(
-    dataQualityScore, acquisitionRiskScore, automationPotentialScore, marginExpansionScore
+    dataQualityScore, acquisitionRiskScore, automationPotentialScore, scaleReadinessScore
   );
+  const valueProfile = buildValueProfile(overallGrade);
 
-  // Top issue — highest dollar impact
+  // Top operational risk: weighted by dollar impact, severity, and manual time
+  const severityWeight = { high: 3, medium: 2, low: 1 };
   const topAnomaly = allAnomalies.length === 0
     ? null
-    : [...allAnomalies].sort((a, b) => b.dollarExposure - a.dollarExposure || b.manualFixMins - a.manualFixMins)[0];
+    : [...allAnomalies]
+        .map((a) => ({
+          a,
+          score: (a.dollarExposure / 10000) * 0.4 + severityWeight[a.severity] * 10 * 0.3 + (a.manualFixMins / 60) * 2 * 0.3,
+        }))
+        .sort((x, y) => y.score - x.score)[0]?.a ?? null;
 
   const topIssue: TopIssue = topAnomaly
     ? {
@@ -677,41 +743,53 @@ export function buildScorecard(
         timeSavedMins: 0,
       };
 
+  const estimatedAnnualTimeRecoveryHours = parseFloat((hoursLostPerMonth * 12).toFixed(1));
+
   return {
     firmName,
     generatedAt,
-    mode,
     dataQualityScore,
     acquisitionRiskScore,
     automationPotentialScore,
-    marginExpansionScore,
+    scaleReadinessScore,
     overallGrade,
     scoreBreakdowns: breakdowns,
     accounts,
     anomalies: allAnomalies,
     topIssue,
+    valueProfile,
     liabilityExposure,
     cleanupCostEstimate,
     hoursLostPerMonth,
+    estimatedAnnualTimeRecoveryHours,
     projectedAnnualSavings,
+    hiddenFinancialExposure,
     aiNarrative: null,
+    dateRangeDays,
   };
 }
 
 function buildTopIssueDescription(a: Anomaly): string {
-  const TYPE_LABELS: Record<string, string> = {
-    duplicate: "duplicate entries",
-    unreconciled: "unreconciled items",
-    miscategorized: "miscategorized transactions",
-    ap_aging: "unpaid bills",
-    ar_aging: "uncollected invoices",
-    owner_dependency: "owner-linked transactions",
-    round_number: "round-number estimates",
-    balance_jump: "unexplained balance jumps",
-  };
-  const label = TYPE_LABELS[a.type] ?? a.type;
   const hours = (a.manualFixMins / 60).toFixed(1);
-  const vendor = a.affectedTransactions.length > 0 ? a.affectedTransactions[0].name || "unknown vendor" : "";
-  const vendorPart = vendor && a.type === "duplicate" ? ` from ${vendor}` : "";
-  return `Your ${a.account} account has ${a.count} ${label}${vendorPart} — estimated ${hours} hours to fix manually.`;
+  const accountsPhrase = a.account === "All Accounts" ? "across accounts" : `across ${a.account}`;
+  switch (a.type) {
+    case "unreconciled":
+      return `${a.count} unreconciled transactions ${accountsPhrase} are creating ${hours} hours of manual review and delaying close quality. Quanto can automate first-pass review and exception routing.`;
+    case "duplicate":
+      return `${a.count} duplicate pair(s) ${accountsPhrase} — ${hours} hours to resolve manually. Quanto flags duplicates before they hit the books.`;
+    case "miscategorized":
+      return `${a.count} miscategorized or uncategorized items ${accountsPhrase} (${hours} hrs to fix). Quanto auto-categorizes from vendor history and flags exceptions.`;
+    case "ap_aging":
+      return `$${a.dollarExposure.toLocaleString()} in unpaid bills (AP aging) — ${a.count} items. Quanto tracks payables and automates reminders before they become overdue.`;
+    case "ar_aging":
+      return `$${a.dollarExposure.toLocaleString()} in uncollected invoices (AR aging) — ${a.count} items. Quanto monitors receivables and escalates collection follow-ups.`;
+    case "owner_dependency":
+      return `Key-person concentration: ${a.count} transactions tied to one or a few names. Increases handoff and acquisition risk. Quanto helps distribute approval and codify workflows.`;
+    case "round_number":
+      return `${a.count} round-number or repeated-amount expenses ${accountsPhrase} — may be estimates. Quanto flags these for invoice verification.`;
+    case "balance_jump":
+      return `Unexplained balance movement(s) on ${a.account} — ${hours} hrs to investigate. Quanto detects large unexplained changes and creates reconciliation tasks.`;
+    default:
+      return `${a.count} flagged items ${accountsPhrase}. Estimated ${hours} hours manual fix. Quanto can automate first-pass review.`;
+  }
 }

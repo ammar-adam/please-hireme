@@ -73,12 +73,12 @@ function buildMapleTransactions(): QBOTransaction[] {
     list.push(tx(prefix, daysAgo(day - 3), account, "Expense", vendor, amount, bal, `Payment to ${vendor}`));
   }
 
-  // 22 unreconciled items — older than 30 days, balance null, type not Deposit/Payment
-  for (let i = 0; i < 22; i++) {
+  // 72 unreconciled items — older than 30 days, balance null, type not Deposit/Payment
+  for (let i = 0; i < 72; i++) {
     const vendor = VENDORS[i % VENDORS.length];
-    const day = 35 + i * 5;
-    const amount = 100 + i * 30;
-    list.push(tx(prefix, daysAgo(day), i < 11 ? "Chequing" : "Accounts Payable", "Expense", vendor, amount, null, "Unreconciled item"));
+    const day = 35 + i * 4;
+    const amount = 80 + i * 25;
+    list.push(tx(prefix, daysAgo(day), i % 3 === 0 ? "Chequing" : i % 3 === 1 ? "Accounts Payable" : "Credit Card", "Expense", vendor, amount, null, "Unreconciled item"));
   }
 
   // 15 miscategorized — blank name or Uncategorized Expense
@@ -89,31 +89,48 @@ function buildMapleTransactions(): QBOTransaction[] {
     list.push(tx(prefix, daysAgo(20 + i * 12), "Chequing", "Expense", "", 600 + i * 100, cheqBal - 600, ""));
   }
 
-  // 8 round-number transactions over $1000
-  const roundAmounts = [1000, 1500, 2000, 2500, 3000, 1500, 2000, 5000];
-  for (let i = 0; i < 8; i++) {
+  // Round-number transactions: exact $1000 multiples above $2000 (triggers detector)
+  const roundAmounts = [2000, 3000, 5000, 2000, 4000, 3000, 5000, 6000, 2000, 3000];
+  for (let i = 0; i < roundAmounts.length; i++) {
     list.push(tx(prefix, daysAgo(10 + i * 14), "Chequing", "Expense", `Vendor ${String.fromCharCode(65 + i)}`, roundAmounts[i], cheqBal - roundAmounts[i], "Estimate"));
   }
 
-  // $18,000 AP outstanding > 60 days
-  const apAmounts = [4500, 3200, 2800, 3500, 4000];
+  // Heavy AP aging: ~$55k+ outstanding > 60 days → big Operational Risk penalty
+  const apAmounts = [12000, 10000, 9000, 8000, 7000, 5000];
   for (let i = 0; i < apAmounts.length; i++) {
     list.push(tx(prefix, daysAgo(70 + i * 8), "Accounts Payable", "Bill", VENDORS[i], apAmounts[i], null, "Outstanding bill"));
   }
 
-  // $9,000 AR outstanding > 90 days
-  const arAmounts = [3000, 2500, 3500];
+  // Heavy AR aging: ~$35k+ > 90 days
+  const arAmounts = [10000, 9000, 8000, 7000, 6000];
   for (let i = 0; i < arAmounts.length; i++) {
     list.push(tx(prefix, daysAgo(100 + i * 10), "Accounts Receivable", "Invoice", `Client ${String.fromCharCode(65 + i)}`, arAmounts[i], null, "Unpaid invoice"));
   }
 
-  // 6 transactions referencing "John Smith" — owner dependency
-  for (let i = 0; i < 6; i++) {
-    list.push(tx(prefix, daysAgo(5 + i * 15), "Chequing", "Expense", "John Smith", 500 + i * 200, cheqBal - 500, "Owner expense"));
+  // Strong owner dependency: 18+ transactions with "Owner" in name → 12 pts + concentration
+  for (let i = 0; i < 18; i++) {
+    list.push(tx(prefix, daysAgo(5 + i * 12), "Chequing", "Expense", "John Smith - Owner", 500 + i * 200, cheqBal - 500, "Owner draw"));
   }
 
-  // Fill remaining with normal transactions to reach 150+
-  for (let i = 0; list.length < 155; i++) {
+  // 3 stale accounts (same balance, long gaps) → critical status → capped OpRisk penalty from accounts
+  const staleAccounts = ["Savings", "Line of Credit", "Petty Cash"];
+  const staleBal = 5000;
+  for (const acc of staleAccounts) {
+    list.push(tx(prefix, daysAgo(200), acc, "Expense", "Misc", 0, staleBal, "Opening"));
+    list.push(tx(prefix, daysAgo(180), acc, "Expense", "Misc", 0, staleBal, "No activity"));
+    list.push(tx(prefix, daysAgo(160), acc, "Expense", "Misc", 0, staleBal, "No activity"));
+  }
+
+  // Three accounts with unexplained balance jumps (≥$15k) so balance_jump detector adds OpRisk penalty
+  list.push(tx(prefix, daysAgo(120), "Line of Credit", "Expense", "Unknown", 0, 20000, ""));
+  list.push(tx(prefix, daysAgo(118), "Line of Credit", "Expense", "Unknown", 0, 5000, ""));
+  list.push(tx(prefix, daysAgo(95), "Reserve", "Expense", "Unknown", 0, 18000, ""));
+  list.push(tx(prefix, daysAgo(93), "Reserve", "Expense", "Unknown", 0, 3000, ""));
+  list.push(tx(prefix, daysAgo(80), "Other Receivable", "Expense", "Unknown", 0, 26000, ""));
+  list.push(tx(prefix, daysAgo(78), "Other Receivable", "Expense", "Unknown", 0, 10000, ""));
+
+  // Fill remaining with normal transactions to reach 200+
+  for (let i = 0; list.length < 210; i++) {
     const day = 1 + (i % 350);
     const acc = ACCOUNTS[i % 4];
     const vendor = VENDORS[i % VENDORS.length];
@@ -164,9 +181,13 @@ function buildCedarTransactions(): QBOTransaction[] {
     }
   }
 
-  // Only 2 miscategorized (minor)
-  list.push(tx(prefix, daysAgo(45), "Uncategorized Expense", "Expense", "Office Depot", 35, null, "Misc office supply"));
-  list.push(tx(prefix, daysAgo(120), "Uncategorized Expense", "Expense", "FedEx", 22, null, "Shipping"));
+  // 4 unreconciled only — minimal blip so Book Quality stays high but Automation Fit gets a small bump (needed for avg ≥ 85)
+  list.push(tx(prefix, daysAgo(45), "Chequing", "Expense", "FedEx", 85, null, "Pending reconciliation"));
+  list.push(tx(prefix, daysAgo(50), "Credit Card", "Expense", "Rogers", 120, null, "Pending reconciliation"));
+  list.push(tx(prefix, daysAgo(55), "Chequing", "Expense", "Bell Canada", 95, null, "Pending reconciliation"));
+  list.push(tx(prefix, daysAgo(60), "Chequing", "Expense", "Office Depot", 110, null, "Pending reconciliation"));
+
+  // No duplicates, no miscategorized, no round numbers, no AP/AR aging, no owner dependency — bonafide A
 
   // Fill to 155
   while (list.length < 155) {
@@ -180,7 +201,7 @@ function buildCedarTransactions(): QBOTransaction[] {
   return list;
 }
 
-// ── Lakeview Bookkeeping Co. (Grade C — acquisition target) ────────
+// ── Lakeview Bookkeeping Co. (Grade C — workable but clear friction; not D) ────────
 
 function buildLakeviewTransactions(): QBOTransaction[] {
   _sampleCounter = 0;
@@ -188,107 +209,102 @@ function buildLakeviewTransactions(): QBOTransaction[] {
   const list: QBOTransaction[] = [];
   let cheqBal = 32000;
 
-  // 15 transactions referencing owner "David Park"
-  for (let i = 0; i < 15; i++) {
-    const amount = 800 + i * 150;
-    list.push(tx(prefix, daysAgo(5 + i * 8), "Chequing", "Expense", "David Park", amount, cheqBal - amount, "Owner expense"));
-  }
-
-  // $32,000 AP aging > 90 days
-  const apItems: [string, number, number][] = [
-    ["Bell Canada", 6500, 95],
-    ["WeWork", 8000, 100],
-    ["Rogers", 5500, 108],
-    ["AWS", 7000, 115],
-    ["Salesforce", 5000, 120],
+  // 7 duplicate pairs (14 pts cap) + 16 unreconciled (18 pts cap) + 8 miscat (10 pts cap) + 5 round → BQ penalty 47 → BQ 53
+  const dupPairs: [string, number, number][] = [
+    ["Bell Canada", 450, 10], ["Rogers", 89, 25], ["Office Depot", 200, 40], ["FedEx", 85, 55],
+    ["Stripe", 199, 85], ["Shopify", 320, 95], ["AWS", 150, 105],
   ];
-  for (const [vendor, amount, day] of apItems) {
-    list.push(tx(prefix, daysAgo(day), "Accounts Payable", "Bill", vendor, amount, null, "Outstanding payable"));
+  for (const [vendor, amount, day] of dupPairs) {
+    list.push(tx(prefix, daysAgo(day), "Chequing", "Expense", vendor, amount, cheqBal - amount, "Payment"));
+    list.push(tx(prefix, daysAgo(day - 2), "Chequing", "Expense", vendor, amount, cheqBal - amount, "Payment"));
   }
 
-  // $21,000 AR > 120 days likely uncollectable
-  const arItems: [string, number, number][] = [
-    ["Client Alpha", 7000, 125],
-    ["Client Beta", 5500, 130],
-    ["Client Gamma", 4500, 140],
-    ["Client Delta", 4000, 150],
-  ];
-  for (const [client, amount, day] of arItems) {
-    list.push(tx(prefix, daysAgo(day), "Accounts Receivable", "Invoice", client, amount, null, "Overdue invoice"));
+  // 16 unreconciled (hits cap 18 pts)
+  for (let i = 0; i < 16; i++) {
+    list.push(tx(prefix, daysAgo(35 + i * 4), i < 10 ? "Chequing" : "Credit Card", "Expense", VENDORS[i % VENDORS.length], 150 + i * 25, null, "Pending reconciliation"));
   }
 
-  // 18 unreconciled items
-  for (let i = 0; i < 18; i++) {
-    const vendor = VENDORS[i % VENDORS.length];
-    const day = 35 + i * 6;
-    list.push(tx(prefix, daysAgo(day), i < 9 ? "Chequing" : "Credit Card", "Expense", vendor, 200 + i * 25, null, "Pending reconciliation"));
+  // 8 miscategorized (hits cap 10 pts)
+  for (let i = 0; i < 4; i++) {
+    list.push(tx(prefix, daysAgo(20 + i * 15), "Uncategorized Expense", "Expense", VENDORS[i], 100 + i * 30, null, "Needs categorization"));
+  }
+  list.push(tx(prefix, daysAgo(50), "Chequing", "Expense", "", 600, null, ""));
+  list.push(tx(prefix, daysAgo(55), "Chequing", "Expense", "", 750, null, ""));
+  list.push(tx(prefix, daysAgo(60), "Chequing", "Expense", "", 800, null, ""));
+  list.push(tx(prefix, daysAgo(65), "Chequing", "Expense", "", 650, null, ""));
+
+  // 5 round-number expenses (≥$2000) so round_number detector adds penalty (cap 5 pts)
+  const roundAmounts = [2000, 3000, 2000, 3000, 5000];
+  for (let i = 0; i < roundAmounts.length; i++) {
+    list.push(tx(prefix, daysAgo(12 + i * 18), "Chequing", "Expense", `Vendor ${String.fromCharCode(65 + i)}`, roundAmounts[i], cheqBal - roundAmounts[i], "Estimate"));
   }
 
-  // Inconsistent categorization — same vendor on different accounts
-  for (let month = 0; month < 6; month++) {
-    const accs = ["Chequing", "Credit Card", "Accounts Payable"];
-    list.push(tx(prefix, daysAgo(month * 30 + 10), accs[month % 3], "Expense", "Bell Canada", 450, month % 3 === 0 ? cheqBal - 450 : null, "Phone"));
-    list.push(tx(prefix, daysAgo(month * 30 + 12), accs[(month + 1) % 3], "Expense", "Rogers", 89, null, "Internet"));
+  // AP ~$35k, AR ~$25k → higher OpRisk penalty so grade lands in C; 4 critical (stale) accounts → +12 capped
+  list.push(tx(prefix, daysAgo(75), "Accounts Payable", "Bill", "Bell Canada", 9000, null, "Outstanding"));
+  list.push(tx(prefix, daysAgo(80), "Accounts Payable", "Bill", "Rogers", 8000, null, "Outstanding"));
+  list.push(tx(prefix, daysAgo(85), "Accounts Payable", "Bill", "WeWork", 7000, null, "Outstanding"));
+  list.push(tx(prefix, daysAgo(92), "Accounts Payable", "Bill", "Office Depot", 5500, null, "Outstanding"));
+  list.push(tx(prefix, daysAgo(95), "Accounts Payable", "Bill", "AWS", 3500, null, "Outstanding"));
+  list.push(tx(prefix, daysAgo(100), "Accounts Receivable", "Invoice", "Client A", 7000, null, "Overdue"));
+  list.push(tx(prefix, daysAgo(105), "Accounts Receivable", "Invoice", "Client B", 6000, null, "Overdue"));
+  list.push(tx(prefix, daysAgo(112), "Accounts Receivable", "Invoice", "Client C", 6000, null, "Overdue"));
+  list.push(tx(prefix, daysAgo(118), "Accounts Receivable", "Invoice", "Client D", 5000, null, "Overdue"));
+
+  // 4 stale accounts → critical status → OpRisk penalty (capped)
+  const staleBal = 3000;
+  for (const acc of ["Savings", "Line of Credit", "Petty Cash", "Other Receivable"]) {
+    list.push(tx(prefix, daysAgo(180), acc, "Expense", "Misc", 0, staleBal, "Opening"));
+    list.push(tx(prefix, daysAgo(160), acc, "Expense", "Misc", 0, staleBal, "No activity"));
+    list.push(tx(prefix, daysAgo(140), acc, "Expense", "Misc", 0, staleBal, "No activity"));
   }
 
-  // 4 balance jumps > $5000 with no matching transaction
-  const jumpDays = [40, 80, 160, 240];
-  for (const day of jumpDays) {
-    list.push(tx(prefix, daysAgo(day + 1), "Chequing", "Expense", VENDORS[0], 100, cheqBal, "Normal expense"));
-    list.push(tx(prefix, daysAgo(day), "Chequing", "Expense", VENDORS[1], 200, cheqBal + 7200, "Normal expense"));
+  // Owner concentration: 8 tx with "Owner" in name
+  for (let i = 0; i < 8; i++) {
+    list.push(tx(prefix, daysAgo(5 + i * 12), "Chequing", "Expense", "David Park - Owner", 500 + i * 80, cheqBal - 500, "Owner draw"));
   }
 
   // Regular transactions to fill
   for (let month = 0; month < 12; month++) {
     const baseDay = month * 30;
-    // Revenue
-    list.push(tx(prefix, daysAgo(baseDay + 1), "Chequing", "Deposit", "Client Payments", 5000 + month * 300, cheqBal + 5000, "Monthly revenue"));
-    // Regular expenses
-    for (let v = 0; v < 6; v++) {
-      const vendor = VENDORS[v];
-      const amount = 150 + v * 40;
-      list.push(tx(prefix, daysAgo(baseDay + 3 + v * 3), "Chequing", "Expense", vendor, amount, cheqBal - amount, `${vendor} monthly`));
+    list.push(tx(prefix, daysAgo(baseDay + 1), "Chequing", "Deposit", "Client Payments", 5000 + month * 200, cheqBal + 5000, "Monthly revenue"));
+    for (let v = 0; v < 5; v++) {
+      list.push(tx(prefix, daysAgo(baseDay + 3 + v * 2), "Chequing", "Expense", VENDORS[v], 120 + v * 35, cheqBal - 120, "Operating"));
     }
   }
 
-  // Fill to 155
-  while (list.length < 155) {
+  while (list.length < 165) {
     const i = list.length;
-    const day = 1 + (i % 340);
-    const vendor = VENDORS[i % VENDORS.length];
-    list.push(tx(prefix, daysAgo(day), "Chequing", "Expense", vendor, 100 + (i % 80), cheqBal - 100, "Operating expense"));
+    list.push(tx(prefix, daysAgo(1 + (i % 340)), "Chequing", "Expense", VENDORS[i % VENDORS.length], 80 + (i % 60), cheqBal - 80, "Operating expense"));
   }
 
   return list;
 }
 
 // ── Export Samples ─────────────────────────────────────────────────
-
-export const messyFirm: SampleDefinition = {
-  id: "maple",
-  firmName: "Maple Advisory Group",
-  description: "Messy books, high anomaly count",
-  grade: "D",
-  transactions: buildMapleTransactions(),
-};
+// Order: A (Cedar), B (Lakeview), D (Maple) for clear demo spread.
 
 export const healthyFirm: SampleDefinition = {
   id: "cedar",
   firmName: "Cedar Table Restaurant",
-  description: "Clean books, well-managed firm",
-  grade: "A",
+  description: "Clean books, low operational risk, easy to onboard",
   transactions: buildCedarTransactions(),
 };
 
 export const acquisitionTarget: SampleDefinition = {
   id: "lakeview",
   firmName: "Lakeview Bookkeeping Co.",
-  description: "Acquisition target with red flags",
-  grade: "C",
+  description: "Workable books with meaningful operational friction; standardize workflows and unlock capacity",
   transactions: buildLakeviewTransactions(),
 };
 
-export const ALL_SAMPLES: SampleDefinition[] = [messyFirm, healthyFirm, acquisitionTarget];
+export const messyFirm: SampleDefinition = {
+  id: "maple",
+  firmName: "Maple Advisory Group",
+  description: "Messy acquisition target with major cleanup burden and hidden risk",
+  transactions: buildMapleTransactions(),
+};
+
+export const ALL_SAMPLES: SampleDefinition[] = [healthyFirm, acquisitionTarget, messyFirm];
 
 // ── Download CSV Helper ────────────────────────────────────────────
 
